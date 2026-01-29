@@ -1,0 +1,208 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  MECHANIC
+  ADMIN
+}
+
+enum BookingStatus {
+  REQUESTED
+  ACCEPTED
+  IN_PROGRESS
+  DONE
+  PAID
+  DELIVERED
+}
+
+enum VehicleType {
+  SEDAN
+  SUV
+  TRUCK
+  BIKE
+}
+
+enum FaultCategory {
+  ENGINE
+  BRAKES
+  ELECTRICAL
+  AC
+  TRANSMISSION
+  OTHER
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  password      String
+  firstName     String?
+  lastName      String?
+  dateOfBirth   DateTime?
+  role          UserRole  @default(USER)
+  emailVerified Boolean   @default(false)
+  emailToken    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  profile       UserProfile?
+  vehicles      Vehicle[]
+  bookings      Booking[]
+  givenRatings  Rating[]   @relation("UserRatings")
+}
+
+model UserProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  phone     String?
+  address   String?
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Mechanic {
+  id            String    @id @default(uuid())
+  userId        String    @unique
+  companyName   String
+  ownerFullName String
+  email         String    @unique
+  password      String
+  emailVerified Boolean   @default(false)
+  emailToken    String?
+  profileComplete Boolean @default(false)
+  isVerified    Boolean   @default(false) // Admin verification - only verified mechanics shown in search
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  profile       MechanicProfile?
+  bookings      Booking[]
+  receivedRatings Rating[] @relation("MechanicRatings")
+}
+
+model MechanicProfile {
+  id               String    @id @default(uuid())
+  mechanicId       String    @unique
+  phone            String?
+  address          String?
+  city             String?
+  state            String?
+  zipCode          String?
+  latitude         Float?
+  longitude        Float?
+  avatar           String?
+  bio              String?
+  availability     Boolean   @default(true)
+  expertise        String[]  // Fault categories: ENGINE, BRAKES, ELECTRICAL, AC, TRANSMISSION, OTHER
+  vehicleTypes     String[]  // Types of vehicles mechanic works on (SEDAN, SUV, TRUCK, BIKE)
+  experience       String?   // e.g. "5 years", "10+ years"
+  workshopAddress  String?   // Location of workshop
+  certificateUrl   String?   // Cloudinary URL for certificate document
+  guarantorName    String?
+  guarantorPhone   String?
+  guarantorAddress String?
+  nin              String?   // National Identification Number
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+}
+
+model Vehicle {
+  id          String      @id @default(uuid())
+  userId      String
+  type        VehicleType
+  brand       String
+  model       String
+  year        Int
+  color       String?
+  licensePlate String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+}
+
+model Fault {
+  id          String        @id @default(uuid())
+  category    FaultCategory
+  name        String
+  description String?
+  questions   Json? // Array of guided questions
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  bookings Booking[]
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  userId      String
+  mechanicId  String?
+  vehicleId   String
+  faultId     String
+  status      BookingStatus @default(REQUESTED)
+  description String?
+  locationLat Float?
+  locationLng Float?
+  locationAddress String?
+  estimatedCost Float?
+  actualCost    Float?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  acceptedAt    DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  paidAt        DateTime?
+  deliveredAt   DateTime?
+
+  user     User     @relation(fields: [userId], references: [id])
+  mechanic Mechanic? @relation(fields: [mechanicId], references: [id])
+  vehicle  Vehicle  @relation(fields: [vehicleId], references: [id])
+  fault    Fault    @relation(fields: [faultId], references: [id])
+  messages Message[]
+  ratings  Rating[]
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  bookingId String
+  senderId  String
+  receiverId String
+  senderType String  // "USER" or "MECHANIC"
+  receiverType String // "USER" or "MECHANIC"
+  content   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
+
+model Rating {
+  id          String   @id @default(uuid())
+  bookingId   String   @unique
+  userId      String
+  mechanicId  String
+  rating      Int      // 1-5 stars
+  comment     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  user    User    @relation("UserRatings", fields: [userId], references: [id])
+  mechanic Mechanic @relation("MechanicRatings", fields: [mechanicId], references: [id])
+}
