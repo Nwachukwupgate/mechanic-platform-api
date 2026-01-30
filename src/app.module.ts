@@ -12,6 +12,7 @@ import { BookingsModule } from './bookings/bookings.module';
 import { ChatModule } from './chat/chat.module';
 import { RatingsModule } from './ratings/ratings.module';
 import { LocationModule } from './location/location.module';
+import { GeocodingModule } from './geocoding/geocoding.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 
@@ -31,6 +32,7 @@ import { PrismaModule } from './common/prisma/prisma.module';
     ChatModule,
     RatingsModule,
     LocationModule,
+    GeocodingModule,
     NotificationsModule,
   ],
   controllers: [AppController],
