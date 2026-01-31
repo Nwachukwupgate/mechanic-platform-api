@@ -24,6 +24,10 @@ Backend API for the Mechanic Marketplace Platform built with NestJS, PostgreSQL,
 - **Email**: Nodemailer
 - **Validation**: class-validator, class-transformer
 
+## Project layout
+
+The frontend lives in the sibling folder **mechanic-platform-frontend** (parent directory). Set `FRONTEND_URL` in `.env` to the frontend dev URL (e.g. `http://localhost:3000`).
+
 ## Prerequisites
 
 - Node.js 18+ 
