@@ -56,6 +56,11 @@ export class UpdateMechanicProfileDto {
   vehicleTypes?: string[];
 
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  brands?: string[];
+
+  @IsOptional()
   @IsString()
   experience?: string;
 

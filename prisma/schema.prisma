@@ -106,8 +106,9 @@ model MechanicProfile {
   avatar           String?
   bio              String?
   availability     Boolean   @default(true)
-  expertise        String[]  // Fault categories: ENGINE, BRAKES, ELECTRICAL, AC, TRANSMISSION, OTHER
-  vehicleTypes     String[]  // Types of vehicles mechanic works on (SEDAN, SUV, TRUCK, BIKE)
+  expertise        String[]  // MECHANICAL (engine/brakes/transmission), ELECTRICAL, AC, OTHER
+  vehicleTypes     String[]  // SALOON, SUV, TRUCK (types mechanic works on)
+  brands           String[]  @default([]) // Car brands mechanic works on (e.g. Toyota, Honda)
   experience       String?   // e.g. "5 years", "10+ years"
   workshopAddress  String?   // Location of workshop
   certificateUrl   String?   // Cloudinary URL for certificate document

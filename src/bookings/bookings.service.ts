@@ -35,15 +35,45 @@ export class BookingsService {
     });
   }
 
-  async findNearbyMechanics(lat: number, lng: number, faultCategory: string, radiusKm: number = 10) {
-    // Only show mechanics with verified email (and admin-verified when isVerified exists)
+  /** Map fault category to mechanic expertise: ENGINE/BRAKES/TRANSMISSION → MECHANICAL */
+  private mapFaultCategoryToExpertise(faultCategory: string): string {
+    if (['ENGINE', 'BRAKES', 'TRANSMISSION'].includes(faultCategory)) {
+      return 'MECHANICAL';
+    }
+    return faultCategory;
+  }
+
+  /** Vehicle type for matching: SEDAN shown as Saloon in UI, mechanics store SALOON */
+  private normaliseVehicleTypeForMatch(type: string): string {
+    return type === 'SEDAN' ? 'SALOON' : type;
+  }
+
+  async findNearbyMechanics(
+    lat: number,
+    lng: number,
+    faultCategory: string,
+    radiusKm: number = 10,
+    vehicleId?: string,
+  ) {
+    const expertiseCategory = this.mapFaultCategoryToExpertise(faultCategory);
+
+    let vehicleType: string | null = null;
+    let vehicleBrand: string | null = null;
+    if (vehicleId) {
+      const vehicle = await this.prisma.vehicle.findUnique({
+        where: { id: vehicleId },
+      });
+      if (vehicle) {
+        vehicleType = this.normaliseVehicleTypeForMatch(vehicle.type);
+        vehicleBrand = vehicle.brand;
+      }
+    }
+
     const mechanics = await this.prisma.mechanicProfile.findMany({
       where: {
-        mechanic: { emailVerified: true },
+        mechanic: { emailVerified: true, isVerified: true },
         availability: true,
-        expertise: {
-          has: faultCategory,
-        },
+        expertise: { has: expertiseCategory },
         latitude: { not: null },
         longitude: { not: null },
       },
@@ -52,8 +82,26 @@ export class BookingsService {
       },
     });
 
-    // Filter by distance
-    const nearbyMechanics = mechanics.filter((m) => {
+    // Filter by vehicle type: mechanic must support this type
+    let byType = mechanics;
+    if (vehicleType) {
+      byType = mechanics.filter((m) =>
+        Array.isArray(m.vehicleTypes) && m.vehicleTypes.length > 0
+          ? m.vehicleTypes.map((t) => (t === 'SEDAN' ? 'SALOON' : t)).includes(vehicleType!)
+          : true,
+      );
+    }
+
+    // Filter by brand: mechanic with no brands = all brands; else must include vehicle brand
+    let byBrand = byType;
+    if (vehicleBrand) {
+      byBrand = byType.filter((m) => {
+        const brands = Array.isArray(m.brands) ? m.brands : [];
+        return brands.length === 0 || brands.some((b) => b.toLowerCase() === vehicleBrand!.toLowerCase());
+      });
+    }
+
+    const nearbyMechanics = byBrand.filter((m) => {
       if (!m.latitude || !m.longitude) return false;
       const distance = this.locationService.calculateDistance(
         lat,
@@ -64,7 +112,6 @@ export class BookingsService {
       return distance <= radiusKm;
     });
 
-    // Sort by distance
     nearbyMechanics.sort((a, b) => {
       const distA = this.locationService.calculateDistance(lat, lng, a.latitude!, a.longitude!);
       const distB = this.locationService.calculateDistance(lat, lng, b.latitude!, b.longitude!);

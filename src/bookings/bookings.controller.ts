@@ -30,12 +30,14 @@ export class BookingsController {
     @Query('lng') lng: string,
     @Query('faultCategory') faultCategory: string,
     @Query('radius') radius?: string,
+    @Query('vehicleId') vehicleId?: string,
   ) {
     return this.bookingsService.findNearbyMechanics(
       parseFloat(lat),
       parseFloat(lng),
       faultCategory,
       radius ? parseFloat(radius) : 10,
+      vehicleId,
     );
   }
 

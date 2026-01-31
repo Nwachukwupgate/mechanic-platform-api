@@ -68,6 +68,24 @@ npm run start:dev
 
 The API will be available at `http://localhost:4000`
 
+## Database connectivity
+
+If you see **"Can't reach database server"** (e.g. when logging in or calling protected routes):
+
+1. **Neon**
+   - Open [Neon Console](https://console.neon.tech) and check the project.
+   - If the database is **paused**, resume it.
+   - Copy the connection string from the dashboard (try both **Pooled** and **Direct**).
+   - In `.env`, set `DATABASE_URL` to that string (no `channel_binding=require`).
+   - Restart the app and run `npm run prisma:migrate` if needed.
+
+2. **Local PostgreSQL (development)**
+   - Install PostgreSQL, then in `.env` set:
+   - `DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/mechanic_platform`
+   - Create the DB: `createdb mechanic_platform`
+   - Run: `npm run prisma:migrate`
+   - Restart the app.
+
 ## API Documentation
 
 Once the server is running, visit `http://localhost:4000/api` for Swagger API documentation.
