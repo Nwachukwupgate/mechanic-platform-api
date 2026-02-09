@@ -25,6 +25,31 @@ enum BookingStatus {
   DELIVERED
 }
 
+enum QuoteStatus {
+  PENDING // Mechanic submitted, waiting for user
+  ACCEPTED // User chose this quote
+  REJECTED // User dismissed this mechanic's quote
+  WITHDRAWN // Mechanic withdrew their quote
+}
+
+enum PaymentMethod {
+  PLATFORM // User pays platform; we take 20%, pay mechanic 80%
+  DIRECT // User pays mechanic directly; mechanic pays us 20%
+}
+
+enum TransactionType {
+  USER_PAYMENT // User paid platform for a booking (Paystack)
+  PLATFORM_PAYOUT // Platform paid mechanic their 80%
+  MECHANIC_FEE // Mechanic paid platform their 20% (for direct bookings)
+  REFUND // Platform refunded user
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
 enum VehicleType {
   SEDAN
   SUV
@@ -55,10 +80,11 @@ model User {
   updatedAt     DateTime  @updatedAt
 
   // Relations
-  profile       UserProfile?
-  vehicles      Vehicle[]
-  bookings      Booking[]
-  givenRatings  Rating[]   @relation("UserRatings")
+  profile      UserProfile?
+  vehicles     Vehicle[]
+  bookings     Booking[]
+  givenRatings Rating[]      @relation("UserRatings")
+  transactions Transaction[]
 }
 
 model UserProfile {
@@ -74,28 +100,31 @@ model UserProfile {
 }
 
 model Mechanic {
-  id            String    @id @default(uuid())
-  userId        String    @unique
-  companyName   String
-  ownerFullName String
-  email         String    @unique
-  password      String
-  emailVerified Boolean   @default(false)
-  emailToken    String?
-  profileComplete Boolean @default(false)
-  isVerified    Boolean   @default(false) // Admin verification - only verified mechanics shown in search
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  companyName     String
+  ownerFullName   String
+  email           String   @unique
+  password        String
+  emailVerified   Boolean  @default(false)
+  emailToken      String?
+  profileComplete Boolean  @default(false)
+  isVerified      Boolean  @default(false) // Admin verification - only verified mechanics shown in search
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   // Relations
-  profile       MechanicProfile?
-  bookings      Booking[]
-  receivedRatings Rating[] @relation("MechanicRatings")
+  profile         MechanicProfile?
+  bookings        Booking[]
+  receivedRatings Rating[]               @relation("MechanicRatings")
+  quotes          BookingQuote[]
+  clarifications  BookingClarification[]
+  transactions    Transaction[]
 }
 
 model MechanicProfile {
-  id               String    @id @default(uuid())
-  mechanicId       String    @unique
+  id               String   @id @default(uuid())
+  mechanicId       String   @unique
   phone            String?
   address          String?
   city             String?
@@ -105,36 +134,36 @@ model MechanicProfile {
   longitude        Float?
   avatar           String?
   bio              String?
-  availability     Boolean   @default(true)
-  expertise        String[]  // MECHANICAL (engine/brakes/transmission), ELECTRICAL, AC, OTHER
-  vehicleTypes     String[]  // SALOON, SUV, TRUCK (types mechanic works on)
-  brands           String[]  @default([]) // Car brands mechanic works on (e.g. Toyota, Honda)
-  experience       String?   // e.g. "5 years", "10+ years"
-  workshopAddress  String?   // Location of workshop
-  certificateUrl   String?   // Cloudinary URL for certificate document
+  availability     Boolean  @default(true)
+  expertise        String[] // MECHANICAL (engine/brakes/transmission), ELECTRICAL, AC, OTHER
+  vehicleTypes     String[] // SALOON, SUV, TRUCK (types mechanic works on)
+  brands           String[] @default([]) // Car brands mechanic works on (e.g. Toyota, Honda)
+  experience       String? // e.g. "5 years", "10+ years"
+  workshopAddress  String? // Location of workshop
+  certificateUrl   String? // Cloudinary URL for certificate document
   guarantorName    String?
   guarantorPhone   String?
   guarantorAddress String?
-  nin              String?   // National Identification Number
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  nin              String? // National Identification Number
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
 }
 
 model Vehicle {
-  id          String      @id @default(uuid())
-  userId      String
-  type        VehicleType
-  brand       String
-  model       String
-  year        Int
-  color       String?
+  id           String      @id @default(uuid())
+  userId       String
+  type         VehicleType
+  brand        String
+  model        String
+  year         Int
+  color        String?
   licensePlate String?
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   bookings Booking[]
 }
 
@@ -151,59 +180,116 @@ model Fault {
 }
 
 model Booking {
-  id          String        @id @default(uuid())
-  userId      String
-  mechanicId  String?
-  vehicleId   String
-  faultId     String
-  status      BookingStatus @default(REQUESTED)
-  description String?
-  locationLat Float?
-  locationLng Float?
-  locationAddress String?
-  estimatedCost Float?
-  actualCost    Float?
+  id                String         @id @default(uuid())
+  userId            String
+  mechanicId        String?
+  vehicleId         String
+  faultId           String
+  status            BookingStatus  @default(REQUESTED)
+  description       String?
+  locationLat       Float?
+  locationLng       Float?
+  locationAddress   String?
+  estimatedCost     Float?
+  actualCost        Float?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  acceptedAt        DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  paidAt            DateTime?
+  deliveredAt       DateTime?
+  paymentMethod     PaymentMethod?
+  paidAmount        Float? // Amount actually paid (for platform: from Paystack; for direct: agreed amount)
+  paystackReference String? // Paystack reference when user pays via platform
+  disputeReason     String? // Set when user/mechanic raises a dispute
+  disputeResolvedAt DateTime? // When admin resolved it
+  resolvedById      String? // Admin user id who resolved
+
+  user           User                   @relation(fields: [userId], references: [id])
+  mechanic       Mechanic?              @relation(fields: [mechanicId], references: [id])
+  vehicle        Vehicle                @relation(fields: [vehicleId], references: [id])
+  fault          Fault                  @relation(fields: [faultId], references: [id])
+  messages       Message[]
+  ratings        Rating[]
+  quotes         BookingQuote[]
+  clarifications BookingClarification[]
+  transactions   Transaction[]
+}
+
+model BookingQuote {
+  id            String      @id @default(uuid())
+  bookingId     String
+  mechanicId    String
+  proposedPrice Float
+  message       String?
+  status        QuoteStatus @default(PENDING)
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
-  acceptedAt    DateTime?
-  startedAt     DateTime?
-  completedAt   DateTime?
-  paidAt        DateTime?
-  deliveredAt   DateTime?
 
-  user     User     @relation(fields: [userId], references: [id])
-  mechanic Mechanic? @relation(fields: [mechanicId], references: [id])
-  vehicle  Vehicle  @relation(fields: [vehicleId], references: [id])
-  fault    Fault    @relation(fields: [faultId], references: [id])
-  messages Message[]
-  ratings  Rating[]
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+
+  @@unique([bookingId, mechanicId])
+}
+
+model BookingClarification {
+  id         String   @id @default(uuid())
+  bookingId  String
+  mechanicId String
+  question   String
+  answer     String?
+  createdAt  DateTime @default(now())
+
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
 }
 
 model Message {
-  id        String   @id @default(uuid())
-  bookingId String
-  senderId  String
-  receiverId String
-  senderType String  // "USER" or "MECHANIC"
+  id           String   @id @default(uuid())
+  bookingId    String
+  senderId     String
+  receiverId   String
+  senderType   String // "USER" or "MECHANIC"
   receiverType String // "USER" or "MECHANIC"
-  content   String
-  read      Boolean  @default(false)
-  createdAt DateTime @default(now())
+  content      String
+  read         Boolean  @default(false)
+  createdAt    DateTime @default(now())
 
   booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
 }
 
 model Rating {
-  id          String   @id @default(uuid())
-  bookingId   String   @unique
-  userId      String
-  mechanicId  String
-  rating      Int      // 1-5 stars
-  comment     String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String   @id @default(uuid())
+  bookingId  String   @unique
+  userId     String
+  mechanicId String
+  rating     Int // 1-5 stars
+  comment    String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  user    User    @relation("UserRatings", fields: [userId], references: [id])
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  user     User     @relation("UserRatings", fields: [userId], references: [id])
   mechanic Mechanic @relation("MechanicRatings", fields: [mechanicId], references: [id])
+}
+
+model Transaction {
+  id                String            @id @default(uuid())
+  type              TransactionType
+  amountMinor       Int // Amount in kobo (NGN) or smallest currency unit
+  currency          String            @default("NGN")
+  status            TransactionStatus @default(PENDING)
+  reference         String? // Internal reference
+  paystackReference String? // Paystack reference for USER_PAYMENT
+  userId            String?
+  mechanicId        String?
+  bookingId         String?
+  description       String?
+  metadata          Json?
+  createdAt         DateTime          @default(now())
+
+  user     User?     @relation(fields: [userId], references: [id])
+  mechanic Mechanic? @relation(fields: [mechanicId], references: [id])
+  booking  Booking?  @relation(fields: [bookingId], references: [id])
 }

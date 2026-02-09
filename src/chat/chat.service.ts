@@ -1,9 +1,20 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 
 @Injectable()
 export class ChatService {
   constructor(private prisma: PrismaService) {}
+
+  /** Chat is only available after the user has accepted a quote (booking has a mechanic). */
+  private async ensureChatAllowed(bookingId: string): Promise<void> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: { mechanicId: true },
+    });
+    if (!booking?.mechanicId) {
+      throw new ForbiddenException('Chat is only available after a quote has been accepted');
+    }
+  }
 
   async createMessage(
     bookingId: string,
@@ -13,6 +24,7 @@ export class ChatService {
     receiverType: string,
     content: string,
   ) {
+    await this.ensureChatAllowed(bookingId);
     return this.prisma.message.create({
       data: {
         bookingId,
@@ -26,6 +38,7 @@ export class ChatService {
   }
 
   async getMessages(bookingId: string) {
+    await this.ensureChatAllowed(bookingId);
     return this.prisma.message.findMany({
       where: { bookingId },
       orderBy: { createdAt: 'asc' },

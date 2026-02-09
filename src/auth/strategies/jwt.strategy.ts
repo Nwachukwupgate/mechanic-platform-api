@@ -24,18 +24,20 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       const mechanic = await this.prisma.mechanic.findUnique({
         where: { id: sub },
       });
-      if (!mechanic) {
-        throw new UnauthorizedException();
-      }
+      if (!mechanic) throw new UnauthorizedException();
       return { ...mechanic, role: 'MECHANIC' };
-    } else {
+    }
+    if (role === 'ADMIN') {
       const user = await this.prisma.user.findUnique({
         where: { id: sub },
       });
-      if (!user) {
-        throw new UnauthorizedException();
-      }
-      return { ...user, role: 'USER' };
+      if (!user || user.role !== 'ADMIN') throw new UnauthorizedException();
+      return { ...user, role: 'ADMIN' };
     }
+    const user = await this.prisma.user.findUnique({
+      where: { id: sub },
+    });
+    if (!user) throw new UnauthorizedException();
+    return { ...user, role: 'USER' };
   }
 }

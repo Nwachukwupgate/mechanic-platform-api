@@ -45,6 +45,12 @@ export class AuthController {
     return this.authService.login(mechanic, UserRole.MECHANIC);
   }
 
+  @Post('login/admin')
+  async loginAdmin(@Body() data: { email: string; password: string }) {
+    const admin = await this.authService.validateUser(data.email, data.password, UserRole.ADMIN);
+    return this.authService.login(admin, UserRole.ADMIN);
+  }
+
   @Get('verify-email')
   async verifyEmail(@Query('token') token: string, @Query('role') role: string) {
     return this.authService.verifyEmail(token, role as UserRole);

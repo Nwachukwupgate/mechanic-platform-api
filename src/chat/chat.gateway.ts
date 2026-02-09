@@ -7,10 +7,10 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
+import { OnEvent } from '@nestjs/event-emitter';
 import { Server, Socket } from 'socket.io';
 import { ChatService } from './chat.service';
 import { BookingsService } from '../bookings/bookings.service';
-import { UseGuards } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 
@@ -46,9 +46,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       client.data.userId = payload.sub;
       client.data.userRole = payload.role;
 
-      // Join booking rooms
-      const bookings = await this.bookingsService.findByUserId(payload.sub);
-      bookings.forEach((booking) => {
+      // Room for real-time quote/booking events (user or mechanic by id)
+      client.join(`account:${payload.sub}`);
+
+      // Join booking rooms for chat only when a quote has been accepted (user and mechanic can chat)
+      const asUser = await this.bookingsService.findByUserId(payload.sub);
+      const asMechanic = payload.role === 'MECHANIC' ? await this.bookingsService.findByMechanicId(payload.sub) : [];
+      const chatBookings = [...asUser.filter((b) => b.mechanicId != null), ...asMechanic];
+      chatBookings.forEach((booking) => {
         client.join(`booking:${booking.id}`);
       });
     } catch (error) {
@@ -58,6 +63,34 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   handleDisconnect(client: Socket) {
     console.log(`Client disconnected: ${client.id}`);
+  }
+
+  // Real-time quote events (emitted by BookingsService via EventEmitter)
+  @OnEvent('quote.created')
+  handleQuoteCreated(payload: { userId: string; bookingId: string; quote: any }) {
+    this.server?.to(`account:${payload.userId}`).emit('quote:created', payload);
+  }
+
+  @OnEvent('quote.updated')
+  handleQuoteUpdated(payload: { userId: string; bookingId: string; quote: any }) {
+    this.server?.to(`account:${payload.userId}`).emit('quote:updated', payload);
+  }
+
+  @OnEvent('quote.rejected')
+  handleQuoteRejected(payload: { mechanicId: string; bookingId: string; quoteId: string }) {
+    this.server?.to(`account:${payload.mechanicId}`).emit('quote:rejected', payload);
+  }
+
+  @OnEvent('quote.accepted')
+  handleQuoteAccepted(payload: {
+    userId: string;
+    mechanicId: string;
+    bookingId: string;
+    quoteId: string;
+    booking: any;
+  }) {
+    this.server?.to(`account:${payload.userId}`).emit('quote:accepted', payload);
+    this.server?.to(`account:${payload.mechanicId}`).emit('quote:accepted', payload);
   }
 
   @SubscribeMessage('join_booking')

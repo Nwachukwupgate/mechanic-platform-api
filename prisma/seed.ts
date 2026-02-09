@@ -1,12 +1,14 @@
-import { PrismaClient, FaultCategory } from '@prisma/client'
+import 'dotenv/config';
+import { PrismaClient, FaultCategory, UserRole } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
 
-const prisma = new PrismaClient()
+const prisma = new PrismaClient();
 
 async function main() {
   console.log('🌱 Starting database seed...')
 
   // Clear existing faults
-  await prisma.fault.deleteMany()
+  // await prisma.fault.deleteMany()
   console.log('✅ Cleared existing faults')
 
   // Seed Faults
@@ -314,14 +316,28 @@ async function main() {
     },
   ]
 
-  for (const fault of faults) {
-    await prisma.fault.create({
-      data: fault,
-    })
+  // for (const fault of faults) {
+  //   await prisma.fault.create({
+  //     data: fault,
+  //   })
+  // }
+
+  console.log(`✅ Seeded ${faults.length} faults`);
+
+  // Create default admin user if env ADMIN_EMAIL and ADMIN_PASSWORD are set
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (adminEmail && adminPassword) {
+    const hashed = await bcrypt.hash(adminPassword, 10);
+    await prisma.user.upsert({
+      where: { email: adminEmail },
+      create: { email: adminEmail, password: hashed, role: UserRole.ADMIN, emailVerified: true },
+      update: { password: hashed, role: UserRole.ADMIN, emailVerified: true },
+    });
+    console.log('✅ Admin user created/updated:', adminEmail);
   }
 
-  console.log(`✅ Seeded ${faults.length} faults`)
-  console.log('🎉 Database seeding completed!')
+  console.log('🎉 Database seeding completed!');
 }
 
 main()
