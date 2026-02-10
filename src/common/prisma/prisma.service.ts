@@ -1,10 +1,11 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 
-/** Use a pool of 10 connections so concurrent API requests don't time out. */
-function datasourceUrl(): string | undefined {
+/** Build connection URL with pool size 10 so concurrent API requests don't time out. */
+function connectionString(): string {
   const url = process.env.DATABASE_URL;
-  if (!url) return undefined;
+  if (!url) throw new Error('DATABASE_URL is required');
   const limit = 'connection_limit=10';
   if (url.includes('connection_limit=')) {
     return url.replace(/connection_limit=\d+/, limit);
@@ -16,8 +17,8 @@ function datasourceUrl(): string | undefined {
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit {
   constructor() {
-    const url = datasourceUrl();
-    super(url ? { datasources: { db: { url } } } : {});
+    const adapter = new PrismaPg({ connectionString: connectionString() });
+    super({ adapter });
   }
 
   async onModuleInit() {
