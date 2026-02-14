@@ -248,14 +248,19 @@ export class AdminService {
           some: { paymentMethod: 'PLATFORM', paidAt: { not: null } },
         },
       },
-      include: { profile: true },
+      include: {
+        profile: true,
+        bankAccounts: { where: { isDefault: true }, take: 1 },
+      },
       orderBy: { companyName: 'asc' },
     });
     const withBalance = await Promise.all(
       mechanics.map(async (m) => {
         const balance = await this.walletService.getMechanicBalance(m.id);
         const owing = await this.walletService.getMechanicOwing(m.id);
-        return { ...m, balance, owing };
+        const defaultBank = m.bankAccounts?.[0] ?? null;
+        const { bankAccounts, ...rest } = m;
+        return { ...rest, defaultBankAccount: defaultBank, balance, owing };
       }),
     );
     return withBalance.filter((m) => m.balance.balanceMinor > 0 || m.owing.owingNaira > 0);

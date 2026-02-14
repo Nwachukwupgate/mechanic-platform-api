@@ -18,6 +18,7 @@ import { UserRole } from '@prisma/client';
 import { InitializePaymentDto } from './dto/initialize-payment.dto';
 import { VerifyPaymentDto } from './dto/verify-payment.dto';
 import { MarkDirectPaidDto } from './dto/mark-direct-paid.dto';
+import { WithdrawDto } from './dto/withdraw.dto';
 import { TransactionType } from '@prisma/client';
 
 @Controller('wallet')
@@ -78,5 +79,13 @@ export class WalletController {
   @Get('summary')
   async getMechanicSummary(@CurrentUser() mechanic: any) {
     return this.walletService.getMechanicWalletSummary(mechanic.id);
+  }
+
+  /** Mechanic: Withdraw balance to default bank account (Paystack Transfer + record payout). */
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('withdraw')
+  async withdraw(@CurrentUser() mechanic: any, @Body() dto: WithdrawDto) {
+    return this.walletService.requestWithdrawal(mechanic.id, dto.amountMinor);
   }
 }

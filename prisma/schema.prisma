@@ -114,11 +114,28 @@ model Mechanic {
 
   // Relations
   profile         MechanicProfile?
+  bankAccounts    MechanicBankAccount[]
   bookings        Booking[]
   receivedRatings Rating[]               @relation("MechanicRatings")
   quotes          BookingQuote[]
   clarifications  BookingClarification[]
   transactions    Transaction[]
+}
+
+model MechanicBankAccount {
+  id            String   @id @default(uuid())
+  mechanicId    String
+  bankCode      String   // e.g. 058 for GTBank (Paystack bank code)
+  bankName      String   // e.g. "Guaranty Trust Bank"
+  accountNumber String
+  accountName   String   // Beneficiary name on the account
+  isDefault     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+
+  @@unique([mechanicId, accountNumber])
 }
 
 model MechanicProfile {

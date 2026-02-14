@@ -99,4 +99,83 @@ export class PaystackService {
       metadata: data.data.metadata,
     };
   }
+
+  /** List Nigerian banks (for mechanic withdrawal account form). Uses Paystack list. */
+  async listBanks(): Promise<{ code: string; name: string }[]> {
+    const res = await fetch(`${PAYSTACK_BASE}/bank?country=nigeria`, {
+      headers: { Authorization: `Bearer ${this.getSecretKey()}` },
+    });
+    const data = (await res.json()) as {
+      status: boolean;
+      data?: Array<{ code: string; name: string }>;
+    };
+    if (!data.status || !Array.isArray(data.data)) return [];
+    return data.data.map((b) => ({ code: b.code, name: b.name }));
+  }
+
+  /** Create a transfer recipient (NUBAN) for sending to a Nigerian bank account. */
+  async createTransferRecipient(
+    bankCode: string,
+    accountNumber: string,
+    accountName: string,
+  ): Promise<{ recipientCode: string }> {
+    const res = await fetch(`${PAYSTACK_BASE}/transferrecipient`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.getSecretKey()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'nuban',
+        name: accountName,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: 'NGN',
+      }),
+    });
+    const data = (await res.json()) as {
+      status: boolean;
+      message?: string;
+      data?: { recipient_code: string };
+    };
+    if (!data.status || !data.data?.recipient_code) {
+      throw new BadRequestException(data.message || 'Failed to create transfer recipient');
+    }
+    return { recipientCode: data.data.recipient_code };
+  }
+
+  /** Initiate transfer to a recipient. Amount in kobo. Reference: 16–50 chars, lowercase alphanumeric, underscore, dash. */
+  async initiateTransfer(
+    amountKobo: number,
+    recipientCode: string,
+    reference: string,
+    reason: string,
+  ): Promise<{ transferCode: string; status: string }> {
+    const res = await fetch(`${PAYSTACK_BASE}/transfer`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.getSecretKey()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        source: 'balance',
+        amount: amountKobo,
+        recipient: recipientCode,
+        reference,
+        reason,
+      }),
+    });
+    const data = (await res.json()) as {
+      status: boolean;
+      message?: string;
+      data?: { transfer_code: string; status: string };
+    };
+    if (!data.status || !data.data) {
+      throw new BadRequestException(data.message || 'Transfer failed');
+    }
+    return {
+      transferCode: data.data.transfer_code ?? '',
+      status: data.data.status ?? 'pending',
+    };
+  }
 }

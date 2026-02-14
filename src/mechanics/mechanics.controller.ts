@@ -1,4 +1,5 @@
-import { Controller, Get, Put, Body, UseGuards, Param, Post, UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Put, Body, UseGuards, Param, Post, Delete } from '@nestjs/common';
+import { UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { MechanicsService } from './mechanics.service';
@@ -9,6 +10,8 @@ import { Roles } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserRole } from '@prisma/client';
 import { UpdateMechanicProfileDto } from './dto/update-mechanic-profile.dto';
+import { AddBankAccountDto } from './dto/add-bank-account.dto';
+import { UpdateBankAccountDto } from './dto/update-bank-account.dto';
 
 @Controller('mechanics')
 export class MechanicsController {
@@ -92,5 +95,51 @@ export class MechanicsController {
     if (!file) throw new BadRequestException('No file uploaded');
     const url = await this.cloudinaryService.uploadImage(file, 'mechanic-avatars');
     return { avatarUrl: url };
+  }
+
+  // ——— Bank accounts (for withdrawals) ———
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Get('me/bank-accounts')
+  async listMyBankAccounts(@CurrentUser() mechanic: any) {
+    return this.mechanicsService.listBankAccounts(mechanic.id);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('me/bank-accounts')
+  async addBankAccount(@CurrentUser() mechanic: any, @Body() body: AddBankAccountDto) {
+    return this.mechanicsService.addBankAccount(mechanic.id, body);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Put('me/bank-accounts/:accountId')
+  async updateBankAccount(
+    @CurrentUser() mechanic: any,
+    @Param('accountId') accountId: string,
+    @Body() body: UpdateBankAccountDto,
+  ) {
+    return this.mechanicsService.updateBankAccount(mechanic.id, accountId, body);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Put('me/bank-accounts/:accountId/default')
+  async setDefaultBankAccount(
+    @CurrentUser() mechanic: any,
+    @Param('accountId') accountId: string,
+  ) {
+    return this.mechanicsService.setDefaultBankAccount(mechanic.id, accountId);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Delete('me/bank-accounts/:accountId')
+  async deleteBankAccount(
+    @CurrentUser() mechanic: any,
+    @Param('accountId') accountId: string,
+  ) {
+    return this.mechanicsService.deleteBankAccount(mechanic.id, accountId);
   }
 }

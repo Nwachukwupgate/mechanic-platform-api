@@ -327,7 +327,75 @@ export class WalletService {
     };
   }
 
-  /** Admin: Record a payout to a mechanic (creates PLATFORM_PAYOUT transaction). */
+  /** Get default bank account for a mechanic. */
+  private async getDefaultBankAccount(mechanicId: string) {
+    const account = await this.prisma.mechanicBankAccount.findFirst({
+      where: { mechanicId, isDefault: true },
+    });
+    if (!account) return null;
+    return account;
+  }
+
+  /** Generate a unique transfer reference (16–50 chars, lowercase alphanumeric, underscore, dash). */
+  private transferReference(prefix: string): string {
+    return `${prefix}_${randomBytes(8).toString('hex')}`;
+  }
+
+  /**
+   * Mechanic: Request withdrawal. Sends money via Paystack Transfer to mechanic's default bank account, then records payout.
+   */
+  async requestWithdrawal(mechanicId: string, amountMinor: number) {
+    const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
+    if (!mechanic) throw new NotFoundException('Mechanic not found');
+    const balance = await this.getMechanicBalance(mechanicId);
+    if (amountMinor <= 0) throw new BadRequestException('Amount must be positive');
+    if (amountMinor > balance.balanceMinor) {
+      throw new BadRequestException(`Amount exceeds balance (₦${(balance.balanceMinor / 100).toLocaleString()})`);
+    }
+    const bankAccount = await this.getDefaultBankAccount(mechanicId);
+    if (!bankAccount) {
+      throw new BadRequestException('Add a default bank account in Wallet before withdrawing');
+    }
+
+    const reference = this.transferReference('wd');
+    let transferCode: string | undefined;
+    try {
+      const { recipientCode } = await this.paystack.createTransferRecipient(
+        bankAccount.bankCode,
+        bankAccount.accountNumber,
+        bankAccount.accountName,
+      );
+      const result = await this.paystack.initiateTransfer(
+        amountMinor,
+        recipientCode,
+        reference,
+        `Withdrawal to ${mechanic.companyName}`,
+      );
+      transferCode = result.transferCode;
+    } catch (err: any) {
+      const msg = err?.message ?? 'Transfer failed';
+      throw new BadRequestException(msg);
+    }
+
+    const tx = await this.prisma.transaction.create({
+      data: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        amountMinor,
+        currency: 'NGN',
+        status: TransactionStatus.SUCCESS,
+        reference,
+        mechanicId,
+        description: `Withdrawal to ${bankAccount.bankName} · ${bankAccount.accountNumber}`,
+        metadata: { transferCode, source: 'mechanic_withdrawal' },
+      },
+      include: { mechanic: { select: { id: true, companyName: true } } },
+    });
+    return tx;
+  }
+
+  /**
+   * Admin: Record a payout to a mechanic. Sends money via Paystack Transfer to mechanic's default bank, then records payout.
+   */
   async recordPayout(mechanicId: string, amountMinor: number, reference?: string, adminId?: string) {
     const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
     if (!mechanic) throw new NotFoundException('Mechanic not found');
@@ -336,16 +404,42 @@ export class WalletService {
     if (amountMinor > balance.balanceMinor) {
       throw new BadRequestException(`Amount exceeds balance (₦${(balance.balanceMinor / 100).toLocaleString()})`);
     }
+    const bankAccount = await this.getDefaultBankAccount(mechanicId);
+    if (!bankAccount) {
+      throw new BadRequestException('Mechanic has no default bank account. Ask them to add one in their Wallet.');
+    }
+
+    const ref = reference?.replace(/[^a-z0-9_-]/g, '_').toLowerCase().slice(0, 50) || this.transferReference('payout');
+    const finalRef = ref.length >= 16 ? ref : `${ref}_${randomBytes(4).toString('hex')}`;
+    let transferCode: string | undefined;
+    try {
+      const { recipientCode } = await this.paystack.createTransferRecipient(
+        bankAccount.bankCode,
+        bankAccount.accountNumber,
+        bankAccount.accountName,
+      );
+      const result = await this.paystack.initiateTransfer(
+        amountMinor,
+        recipientCode,
+        finalRef,
+        `Payout to ${mechanic.companyName}`,
+      );
+      transferCode = result.transferCode;
+    } catch (err: any) {
+      const msg = err?.message ?? 'Transfer failed';
+      throw new BadRequestException(msg);
+    }
+
     const tx = await this.prisma.transaction.create({
       data: {
         type: TransactionType.PLATFORM_PAYOUT,
         amountMinor,
         currency: 'NGN',
         status: TransactionStatus.SUCCESS,
-        reference: reference ?? `payout_${mechanicId}_${Date.now()}`,
+        reference: finalRef,
         mechanicId,
         description: `Payout to ${mechanic.companyName}`,
-        metadata: adminId ? { adminId } : undefined,
+        metadata: adminId ? { adminId, transferCode } : { transferCode },
       },
       include: { mechanic: { select: { id: true, companyName: true } } },
     });
