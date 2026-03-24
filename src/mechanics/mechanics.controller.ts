@@ -142,4 +142,11 @@ export class MechanicsController {
   ) {
     return this.mechanicsService.deleteBankAccount(mechanic.id, accountId);
   }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('me/delete-account')
+  async deleteMyAccount(@CurrentUser() mechanic: any) {
+    return this.mechanicsService.deleteAccount(mechanic.id);
+  }
 }

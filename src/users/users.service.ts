@@ -1,5 +1,6 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { DeleteUserAccountDto } from './dto/delete-user-account.dto';
 
 @Injectable()
 export class UsersService {
@@ -34,5 +35,46 @@ export class UsersService {
         ...data,
       },
     });
+  }
+
+  /**
+   * Permanently remove the user account and related data (bookings, vehicles, wallet rows, etc.).
+   * Logs optional exit feedback for product insight.
+   */
+  async deleteAccount(userId: string, dto: DeleteUserAccountDto) {
+    const reasons = dto.reasons ?? [];
+    const other = dto.otherReason?.trim() ?? '';
+    if (reasons.length === 0 && !other) {
+      throw new BadRequestException('Select at least one reason or describe why you are leaving.');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.accountDeletionLog.create({
+        data: {
+          role: 'USER',
+          reasons: reasons.length ? reasons : ['(other only)'],
+          otherText: other || null,
+        },
+      });
+
+      const bookingIds = (
+        await tx.booking.findMany({
+          where: { userId },
+          select: { id: true },
+        })
+      ).map((b) => b.id);
+
+      if (bookingIds.length > 0) {
+        await tx.transaction.deleteMany({ where: { bookingId: { in: bookingIds } } });
+      }
+
+      await tx.transaction.deleteMany({ where: { userId } });
+      await tx.booking.deleteMany({ where: { userId } });
+      await tx.vehicle.deleteMany({ where: { userId } });
+      await tx.userProfile.deleteMany({ where: { userId } });
+      await tx.user.delete({ where: { id: userId } });
+    });
+
+    return { deleted: true };
   }
 }

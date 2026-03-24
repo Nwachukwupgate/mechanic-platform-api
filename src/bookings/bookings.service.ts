@@ -73,7 +73,7 @@ export class BookingsService {
 
     const mechanics = await this.prisma.mechanicProfile.findMany({
       where: {
-        mechanic: { emailVerified: true, isVerified: true },
+        mechanic: { emailVerified: true, isVerified: true, deletedAt: null },
         availability: true,
         expertise: { has: expertiseCategory },
         latitude: { not: null },

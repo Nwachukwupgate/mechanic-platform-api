@@ -22,6 +22,9 @@ export class AuthService {
     let user: any;
     if (role === UserRole.MECHANIC) {
       user = await this.prisma.mechanic.findUnique({ where: { email } });
+      if (user?.deletedAt) {
+        throw new UnauthorizedException('Invalid credentials');
+      }
     } else if (role === UserRole.ADMIN) {
       user = await this.prisma.user.findFirst({ where: { email, role: UserRole.ADMIN } });
       if (!user) throw new UnauthorizedException('Invalid credentials');

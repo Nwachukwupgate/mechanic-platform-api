@@ -24,7 +24,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       const mechanic = await this.prisma.mechanic.findUnique({
         where: { id: sub },
       });
-      if (!mechanic) throw new UnauthorizedException();
+      if (!mechanic || mechanic.deletedAt) throw new UnauthorizedException();
       return { ...mechanic, role: 'MECHANIC' };
     }
     if (role === 'ADMIN') {

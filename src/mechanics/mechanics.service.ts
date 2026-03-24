@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
+import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class MechanicsService {
@@ -121,7 +123,7 @@ export class MechanicsService {
       include: { profile: true },
     });
 
-    if (!mechanic) {
+    if (!mechanic || mechanic.deletedAt) {
       throw new NotFoundException('Mechanic not found');
     }
 
@@ -171,7 +173,73 @@ export class MechanicsService {
 
   async findAll() {
     return this.prisma.mechanic.findMany({
+      where: { deletedAt: null },
       include: { profile: true },
     });
+  }
+
+  /** Soft-delete mechanic account (preserves booking/rating history). */
+  async deleteAccount(mechanicId: string) {
+    const mechanic = await this.prisma.mechanic.findUnique({
+      where: { id: mechanicId },
+    });
+    if (!mechanic) throw new NotFoundException('Mechanic not found');
+    if (mechanic.deletedAt) {
+      throw new BadRequestException('Account already deleted');
+    }
+
+    const freshEmail = `deleted_${mechanicId}_${Date.now()}@deleted.local`;
+    const randomPass = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.accountDeletionLog.create({
+        data: {
+          role: 'MECHANIC',
+          reasons: ['mechanic_initiated'],
+          otherText: null,
+        },
+      });
+      await tx.mechanicBankAccount.deleteMany({ where: { mechanicId } });
+      await tx.mechanicProfile.updateMany({
+        where: { mechanicId },
+        data: {
+          phone: null,
+          address: null,
+          city: null,
+          state: null,
+          zipCode: null,
+          latitude: null,
+          longitude: null,
+          avatar: null,
+          bio: null,
+          workshopAddress: null,
+          certificateUrl: null,
+          guarantorName: null,
+          guarantorPhone: null,
+          guarantorAddress: null,
+          nin: null,
+          brands: [],
+          expertise: [],
+          vehicleTypes: [],
+          availability: false,
+        },
+      });
+      await tx.mechanic.update({
+        where: { id: mechanicId },
+        data: {
+          deletedAt: new Date(),
+          email: freshEmail,
+          password: randomPass,
+          emailToken: null,
+          emailVerified: false,
+          companyName: 'Deleted account',
+          ownerFullName: 'Deleted',
+          profileComplete: false,
+          isVerified: false,
+        },
+      });
+    });
+
+    return { deleted: true };
   }
 }

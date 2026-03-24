@@ -65,6 +65,14 @@ enum FaultCategory {
   OTHER
 }
 
+model AccountDeletionLog {
+  id         String   @id @default(uuid())
+  role       String // USER | MECHANIC
+  reasons    Json // string[]
+  otherText  String?
+  createdAt  DateTime @default(now())
+}
+
 model User {
   id            String    @id @default(uuid())
   email         String    @unique
@@ -99,18 +107,19 @@ model UserProfile {
 }
 
 model Mechanic {
-  id              String   @id @default(uuid())
-  userId          String   @unique
+  id              String    @id @default(uuid())
+  userId          String    @unique
   companyName     String
   ownerFullName   String
-  email           String   @unique
+  email           String    @unique
   password        String
-  emailVerified   Boolean  @default(false)
+  emailVerified   Boolean   @default(false)
   emailToken      String?
-  profileComplete Boolean  @default(false)
-  isVerified      Boolean  @default(false) // Admin verification - only verified mechanics shown in search
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  profileComplete Boolean   @default(false)
+  isVerified      Boolean   @default(false) // Admin verification - only verified mechanics shown in search
+  deletedAt       DateTime? // Soft delete: account closed, history retained for bookings/ratings
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   // Relations
   profile         MechanicProfile?
