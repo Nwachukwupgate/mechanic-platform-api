@@ -87,4 +87,13 @@ export class UpdateMechanicProfileDto {
   @IsOptional()
   @IsString()
   nin?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Type(() => Number)
+  typicalResponseHours?: number | null;
+
+  @IsOptional()
+  @IsString()
+  nextAvailableNote?: string | null;
 }

@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Put, Post, Delete, Body, Param, UseGuards } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../common/guards/roles.guard';
@@ -26,5 +26,31 @@ export class UsersController {
   @Roles(UserRole.USER)
   async deleteAccount(@CurrentUser() user: any, @Body() body: DeleteUserAccountDto) {
     return this.usersService.deleteAccount(user.id, body);
+  }
+
+  @Post('me/blocked-mechanics')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.USER)
+  async blockMechanic(@CurrentUser() user: any, @Body() body: { mechanicId: string }) {
+    return this.usersService.blockMechanic(user.id, body.mechanicId);
+  }
+
+  @Delete('me/blocked-mechanics/:mechanicId')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.USER)
+  async unblockMechanic(@CurrentUser() user: any, @Param('mechanicId') mechanicId: string) {
+    return this.usersService.unblockMechanic(user.id, mechanicId);
+  }
+
+  @Get('me/blocked-mechanics')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.USER)
+  async listBlocked(@CurrentUser() user: any) {
+    return this.usersService.listBlockedMechanics(user.id);
+  }
+
+  @Put('me/push-token')
+  async setPushToken(@CurrentUser() user: any, @Body() body: { token: string | null }) {
+    return this.usersService.setExpoPushToken(user.id, body.token ?? null);
   }
 }

@@ -159,6 +159,13 @@ export class MechanicsService {
     return profile;
   }
 
+  async setExpoPushToken(mechanicId: string, token: string | null) {
+    return this.prisma.mechanic.update({
+      where: { id: mechanicId },
+      data: { expoPushToken: token },
+    });
+  }
+
   async updateAvailability(mechanicId: string, availability: boolean) {
     return this.prisma.mechanicProfile.upsert({
       where: { mechanicId },

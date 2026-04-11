@@ -52,7 +52,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Join booking rooms for chat only when a quote has been accepted (user and mechanic can chat)
       const asUser = await this.bookingsService.findByUserId(payload.sub);
       const asMechanic = payload.role === 'MECHANIC' ? await this.bookingsService.findByMechanicId(payload.sub) : [];
-      const chatBookings = [...asUser.filter((b) => b.mechanicId != null), ...asMechanic];
+      const chatBookings = [
+        ...asUser.filter((b) => b.mechanicId != null && b.status !== 'REQUESTED'),
+        ...asMechanic.filter((b) => b.mechanicId != null && b.status !== 'REQUESTED'),
+      ];
       chatBookings.forEach((booking) => {
         client.join(`booking:${booking.id}`);
       });

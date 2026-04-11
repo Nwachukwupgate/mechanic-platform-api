@@ -22,6 +22,7 @@ enum BookingStatus {
   DONE
   PAID
   DELIVERED
+  EXPIRED
 }
 
 enum QuoteStatus {
@@ -92,6 +93,8 @@ model User {
   bookings     Booking[]
   givenRatings Rating[]      @relation("UserRatings")
   transactions Transaction[]
+  blockedMechanics UserBlocksMechanic[]
+  expoPushToken    String?
 }
 
 model UserProfile {
@@ -129,6 +132,8 @@ model Mechanic {
   quotes          BookingQuote[]
   clarifications  BookingClarification[]
   transactions    Transaction[]
+  blockedByUsers  UserBlocksMechanic[]
+  expoPushToken   String?
 }
 
 model MechanicBankAccount {
@@ -166,6 +171,10 @@ model MechanicProfile {
   experience       String? // e.g. "5 years", "10+ years"
   workshopAddress  String? // Location of workshop
   certificateUrl   String? // Cloudinary URL for certificate document
+  /** Shown on profile/cards: typical hours until first response (e.g. 24) */
+  typicalResponseHours Int?
+  /** Free text e.g. "Earliest slot: tomorrow afternoon" */
+  nextAvailableNote    String?
   guarantorName    String?
   guarantorPhone   String?
   guarantorAddress String?
@@ -230,6 +239,9 @@ model Booking {
   disputeReason     String? // Set when user/mechanic raises a dispute
   disputeResolvedAt DateTime? // When admin resolved it
   resolvedById      String? // Admin user id who resolved
+  photoUrls         String[]             @default([])
+  /** Open-board requests only: auto-expire after this time */
+  openRequestExpiresAt DateTime?
 
   user           User                   @relation(fields: [userId], references: [id])
   mechanic       Mechanic?              @relation(fields: [mechanicId], references: [id])
@@ -240,6 +252,31 @@ model Booking {
   quotes         BookingQuote[]
   clarifications BookingClarification[]
   transactions   Transaction[]
+  reports        BookingReport[]
+}
+
+model BookingReport {
+  id           String   @id @default(uuid())
+  bookingId    String
+  reporterId   String // User.id or Mechanic.id depending on reporterRole
+  reporterRole String // USER | MECHANIC
+  reason       String
+  details      String?
+  createdAt    DateTime @default(now())
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
+
+model UserBlocksMechanic {
+  id String   @id @default(uuid())
+  userId     String
+  mechanicId String
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mechanicId])
 }
 
 model BookingQuote {
@@ -249,6 +286,8 @@ model BookingQuote {
   proposedPrice Float
   message       String?
   status        QuoteStatus @default(PENDING)
+  /** Number of times proposedPrice was changed after initial submit (caps revisions) */
+  priceUpdateCount Int      @default(0)
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
@@ -279,6 +318,7 @@ model Message {
   receiverType String // "USER" or "MECHANIC"
   content      String
   read         Boolean  @default(false)
+  readAt       DateTime?
   createdAt    DateTime @default(now())
 
   booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)

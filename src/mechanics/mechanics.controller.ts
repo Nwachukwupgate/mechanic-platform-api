@@ -46,6 +46,13 @@ export class MechanicsController {
 
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.MECHANIC)
+  @Put('me/push-token')
+  async setPushToken(@CurrentUser() mechanic: any, @Body() body: { token: string | null }) {
+    return this.mechanicsService.setExpoPushToken(mechanic.id, body.token ?? null);
+  }
+
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.MECHANIC)
   @Put('me/availability')
   async updateAvailability(@CurrentUser() mechanic: any, @Body() data: { availability: boolean }) {
     return this.mechanicsService.updateAvailability(mechanic.id, data.availability);

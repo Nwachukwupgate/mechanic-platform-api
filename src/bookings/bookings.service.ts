@@ -4,6 +4,10 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { BookingStatus, UserRole, QuoteStatus } from '@prisma/client';
 import { LocationService } from '../location/location.service';
 
+const OPEN_REQUEST_EXPIRY_DAYS = 7;
+/** Max times the mechanic can change the quoted price after first submit (per booking). */
+const MAX_QUOTE_PRICE_REVISIONS = 2;
+
 @Injectable()
 export class BookingsService {
   constructor(
@@ -11,6 +15,18 @@ export class BookingsService {
     private locationService: LocationService,
     private eventEmitter: EventEmitter2,
   ) {}
+
+  /** Expire open-board jobs past `openRequestExpiresAt`. */
+  async expireStaleOpenBookingRequests(): Promise<void> {
+    await this.prisma.booking.updateMany({
+      where: {
+        status: BookingStatus.REQUESTED,
+        mechanicId: null,
+        openRequestExpiresAt: { lte: new Date() },
+      },
+      data: { status: BookingStatus.EXPIRED },
+    });
+  }
 
   async create(userId: string, data: {
     vehicleId: string;
@@ -20,14 +36,22 @@ export class BookingsService {
     locationLat?: number;
     locationLng?: number;
     locationAddress?: string;
+    photoUrls?: string[];
   }) {
-    const { mechanicId, ...rest } = data;
+    const { mechanicId, photoUrls, ...rest } = data;
+    const openUntil = !mechanicId
+      ? new Date(Date.now() + OPEN_REQUEST_EXPIRY_DAYS * 86400000)
+      : null;
     return this.prisma.booking.create({
       data: {
         userId,
         ...rest,
         ...(mechanicId && { mechanicId }),
         status: BookingStatus.REQUESTED,
+        openRequestExpiresAt: openUntil,
+        ...(Array.isArray(photoUrls) && photoUrls.length
+          ? { photoUrls: photoUrls.slice(0, 5) }
+          : {}),
       },
       include: {
         vehicle: true,
@@ -56,8 +80,22 @@ export class BookingsService {
     faultCategory: string,
     radiusKm: number = 10,
     vehicleId?: string,
+    opts?: {
+      userId?: string;
+      minRating?: number;
+      availableOnly?: boolean;
+    },
   ) {
     const expertiseCategory = this.mapFaultCategoryToExpertise(faultCategory);
+
+    let blockedMechanicIds: string[] = [];
+    if (opts?.userId) {
+      const blocks = await this.prisma.userBlocksMechanic.findMany({
+        where: { userId: opts.userId },
+        select: { mechanicId: true },
+      });
+      blockedMechanicIds = blocks.map((b) => b.mechanicId);
+    }
 
     let vehicleType: string | null = null;
     let vehicleBrand: string | null = null;
@@ -73,14 +111,21 @@ export class BookingsService {
 
     const mechanics = await this.prisma.mechanicProfile.findMany({
       where: {
-        mechanic: { emailVerified: true, isVerified: true, deletedAt: null },
-        availability: true,
+        mechanic: {
+          emailVerified: true,
+          isVerified: true,
+          deletedAt: null,
+          ...(blockedMechanicIds.length
+            ? { id: { notIn: blockedMechanicIds } }
+            : {}),
+        },
+        ...(opts?.availableOnly === false ? {} : { availability: true }),
         expertise: { has: expertiseCategory },
         latitude: { not: null },
         longitude: { not: null },
       },
       include: {
-        mechanic: true,
+        mechanic: { include: { receivedRatings: { select: { rating: true } } } },
       },
     });
 
@@ -120,10 +165,38 @@ export class BookingsService {
       return distA - distB;
     });
 
-    return nearbyMechanics;
+    let withRating = nearbyMechanics.map((m) => {
+      const ratings = m.mechanic?.receivedRatings ?? [];
+      const avg =
+        ratings.length > 0
+          ? ratings.reduce((s, r) => s + r.rating, 0) / ratings.length
+          : null;
+      const distanceKm = this.locationService.calculateDistance(
+        lat,
+        lng,
+        m.latitude!,
+        m.longitude!,
+      );
+      const { receivedRatings, ...mechanicWithoutR } = m.mechanic as any;
+      return {
+        ...m,
+        mechanic: mechanicWithoutR,
+        distanceKm,
+        averageRating: avg,
+      };
+    });
+
+    if (opts?.minRating != null && opts.minRating > 0) {
+      withRating = withRating.filter(
+        (m) => m.averageRating != null && m.averageRating >= opts.minRating!,
+      );
+    }
+
+    return withRating;
   }
 
   async findByUserId(userId: string) {
+    await this.expireStaleOpenBookingRequests();
     return this.prisma.booking.findMany({
       where: { userId },
       include: {
@@ -138,6 +211,7 @@ export class BookingsService {
   }
 
   async findByMechanicId(mechanicId: string) {
+    await this.expireStaleOpenBookingRequests();
     return this.prisma.booking.findMany({
       where: { mechanicId },
       include: {
@@ -152,6 +226,7 @@ export class BookingsService {
   }
 
   async findById(id: string) {
+    await this.expireStaleOpenBookingRequests();
     const booking = await this.prisma.booking.findUnique({
       where: { id },
       include: {
@@ -174,6 +249,10 @@ export class BookingsService {
           include: { mechanic: { include: { profile: true } } },
           orderBy: { createdAt: 'asc' },
         },
+        transactions: {
+          orderBy: { createdAt: 'desc' },
+          take: 30,
+        },
       },
     });
 
@@ -181,8 +260,10 @@ export class BookingsService {
       throw new NotFoundException('Booking not found');
     }
 
-    // Chat is only visible after a quote has been accepted
-    if (!booking.mechanicId) {
+    // Chat only after the job leaves REQUESTED (e.g. user accepted a quote or legacy accept)
+    const chatReleased =
+      booking.mechanicId != null && booking.status !== BookingStatus.REQUESTED;
+    if (!chatReleased) {
       return { ...booking, messages: [] };
     }
     return booking;
@@ -234,10 +315,17 @@ export class BookingsService {
         break;
     }
 
-    return this.prisma.booking.update({
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: updateData,
     });
+    this.eventEmitter.emit('booking.statusChanged', {
+      bookingId,
+      status,
+      userId: booking.userId,
+      mechanicId: booking.mechanicId,
+    });
+    return updated;
   }
 
   async updateCost(bookingId: string, cost: number, userId: string, role: UserRole) {
@@ -278,8 +366,21 @@ export class BookingsService {
       include: { fault: true, vehicle: true },
     });
     if (!booking) throw new NotFoundException('Booking not found');
-    if (booking.status !== BookingStatus.REQUESTED || booking.mechanicId) {
+    if (booking.status !== BookingStatus.REQUESTED) {
       throw new BadRequestException('Booking is no longer accepting quotes');
+    }
+    // Open request: any matching mechanic can quote. Targeted request: only the chosen mechanic.
+    if (booking.mechanicId && booking.mechanicId !== mechanicId) {
+      throw new BadRequestException('Only the mechanic this job was sent to can submit a quote');
+    }
+
+    const existingQ = await this.prisma.bookingQuote.findUnique({
+      where: { bookingId_mechanicId: { bookingId, mechanicId } },
+    });
+    if (existingQ && existingQ.priceUpdateCount >= MAX_QUOTE_PRICE_REVISIONS) {
+      throw new BadRequestException(
+        `You can only revise your quoted price up to ${MAX_QUOTE_PRICE_REVISIONS} times. Start a new conversation or ask the customer to re-open the job.`,
+      );
     }
 
     const quote = await this.prisma.bookingQuote.upsert({
@@ -292,11 +393,13 @@ export class BookingsService {
         proposedPrice,
         message: message ?? null,
         status: QuoteStatus.PENDING,
+        priceUpdateCount: 0,
       },
       update: {
         proposedPrice,
         message: message ?? undefined,
         status: QuoteStatus.PENDING,
+        priceUpdateCount: { increment: 1 },
       },
       include: {
         mechanic: { include: { profile: true } },
@@ -324,11 +427,17 @@ export class BookingsService {
     if (quote.booking.status !== BookingStatus.REQUESTED) {
       throw new BadRequestException('Booking is no longer accepting quote updates');
     }
+    if (quote.priceUpdateCount >= MAX_QUOTE_PRICE_REVISIONS) {
+      throw new BadRequestException(
+        `Maximum price revisions (${MAX_QUOTE_PRICE_REVISIONS}) reached for this quote.`,
+      );
+    }
 
     const updated = await this.prisma.bookingQuote.update({
       where: { id: quoteId },
       data: {
         proposedPrice,
+        priceUpdateCount: { increment: 1 },
         ...(quote.status === QuoteStatus.REJECTED ? { status: QuoteStatus.PENDING } : {}),
       },
       include: {
@@ -435,6 +544,7 @@ export class BookingsService {
 
   /** Open booking requests that match this mechanic (expertise + optional location). Mechanics see these to submit a price. */
   async findOpenRequestsForMechanic(mechanicId: string, radiusKm: number = 50) {
+    await this.expireStaleOpenBookingRequests();
     const profile = await this.prisma.mechanicProfile.findUnique({
       where: { mechanicId },
       include: { mechanic: true },
@@ -532,8 +642,11 @@ export class BookingsService {
       include: { clarifications: true },
     });
     if (!booking) throw new NotFoundException('Booking not found');
-    if (booking.status !== BookingStatus.REQUESTED || booking.mechanicId) {
+    if (booking.status !== BookingStatus.REQUESTED) {
       throw new BadRequestException('Only open requests accept clarification questions');
+    }
+    if (booking.mechanicId && booking.mechanicId !== mechanicId) {
+      throw new BadRequestException('Only the mechanic this job was sent to can ask questions');
     }
     const trimmed = question?.trim();
     if (!trimmed || trimmed.length > 500) {
@@ -604,5 +717,150 @@ export class BookingsService {
         },
       },
     });
+  }
+
+  async reportBooking(
+    bookingId: string,
+    reporterId: string,
+    reporterRole: 'USER' | 'MECHANIC',
+    reason: string,
+    details?: string,
+  ) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (reporterRole === 'USER' && booking.userId !== reporterId) {
+      throw new NotFoundException('Booking not found');
+    }
+    if (reporterRole === 'MECHANIC') {
+      const onBooking = booking.mechanicId === reporterId;
+      const quoted = onBooking
+        ? true
+        : !!(await this.prisma.bookingQuote.findFirst({
+            where: { bookingId, mechanicId: reporterId },
+          }));
+      if (!quoted) throw new NotFoundException('Booking not found');
+    }
+    const r = reason?.trim();
+    if (!r || r.length > 200) {
+      throw new BadRequestException('Reason is required (max 200 characters)');
+    }
+    return this.prisma.bookingReport.create({
+      data: {
+        bookingId,
+        reporterId,
+        reporterRole,
+        reason: r,
+        details: details?.trim()?.slice(0, 2000) || null,
+      },
+    });
+  }
+
+  async raiseDispute(bookingId: string, actorId: string, role: UserRole, reason: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (role === UserRole.USER && booking.userId !== actorId) {
+      throw new NotFoundException('Booking not found');
+    }
+    if (role === UserRole.MECHANIC && booking.mechanicId !== actorId) {
+      throw new NotFoundException('Booking not found');
+    }
+    const r = reason?.trim();
+    if (!r || r.length > 1000) {
+      throw new BadRequestException('Describe the issue (1–1000 characters)');
+    }
+    if (booking.disputeReason) {
+      throw new BadRequestException('A dispute is already open for this booking');
+    }
+    return this.prisma.booking.update({
+      where: { id: bookingId },
+      data: { disputeReason: r },
+      include: {
+        vehicle: true,
+        fault: true,
+        mechanic: { include: { profile: true } },
+        user: { include: { profile: true } },
+      },
+    });
+  }
+
+  async appendBookingPhotoUrls(bookingId: string, userId: string, urls: string[]) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking || booking.userId !== userId) throw new NotFoundException('Booking not found');
+    if (booking.status !== BookingStatus.REQUESTED) {
+      throw new BadRequestException('Photos can only be added while the request is open');
+    }
+    const clean = urls.filter((u) => typeof u === 'string' && u.startsWith('http')).slice(0, 5);
+    if (clean.length === 0) throw new BadRequestException('No valid image URLs');
+    const merged = [...(booking.photoUrls ?? []), ...clean].slice(0, 5);
+    return this.prisma.booking.update({
+      where: { id: bookingId },
+      data: { photoUrls: merged },
+    });
+  }
+
+  async getBookingReceipt(bookingId: string, requesterId: string, role: UserRole) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: {
+        vehicle: true,
+        fault: true,
+        mechanic: { include: { profile: true } },
+        user: { include: { profile: true } },
+        transactions: { orderBy: { createdAt: 'desc' }, take: 20 },
+      },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (role === UserRole.USER && booking.userId !== requesterId) {
+      throw new NotFoundException('Booking not found');
+    }
+    if (role === UserRole.MECHANIC && booking.mechanicId !== requesterId) {
+      throw new NotFoundException('Booking not found');
+    }
+    return {
+      bookingId: booking.id,
+      reference: booking.paystackReference,
+      status: booking.status,
+      paidAt: booking.paidAt,
+      paymentMethod: booking.paymentMethod,
+      paidAmount: booking.paidAmount,
+      estimatedCost: booking.estimatedCost,
+      vehicle: booking.vehicle,
+      fault: booking.fault,
+      mechanic: booking.mechanic
+        ? {
+            companyName: booking.mechanic.companyName,
+            ownerFullName: booking.mechanic.ownerFullName,
+          }
+        : null,
+      customer:
+        booking.user?.firstName || booking.user?.lastName
+          ? `${booking.user.firstName ?? ''} ${booking.user.lastName ?? ''}`.trim()
+          : booking.user?.email,
+      transactions: booking.transactions,
+    };
+  }
+
+  async markBookingMessagesRead(bookingId: string, readerId: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: { mechanicId: true, userId: true, status: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.userId !== readerId && booking.mechanicId !== readerId) {
+      throw new NotFoundException('Booking not found');
+    }
+    if (booking.status === BookingStatus.REQUESTED) {
+      throw new BadRequestException('Chat is not active for this booking');
+    }
+    const now = new Date();
+    await this.prisma.message.updateMany({
+      where: {
+        bookingId,
+        receiverId: readerId,
+        read: false,
+      },
+      data: { read: true, readAt: now },
+    });
+    return { ok: true };
   }
 }

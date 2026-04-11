@@ -77,4 +77,35 @@ export class UsersService {
 
     return { deleted: true };
   }
+
+  async blockMechanic(userId: string, mechanicId: string) {
+    return this.prisma.userBlocksMechanic.upsert({
+      where: {
+        userId_mechanicId: { userId, mechanicId },
+      },
+      create: { userId, mechanicId },
+      update: {},
+    });
+  }
+
+  async unblockMechanic(userId: string, mechanicId: string) {
+    await this.prisma.userBlocksMechanic.deleteMany({
+      where: { userId, mechanicId },
+    });
+    return { ok: true };
+  }
+
+  async listBlockedMechanics(userId: string) {
+    return this.prisma.userBlocksMechanic.findMany({
+      where: { userId },
+      include: { mechanic: { include: { profile: true } } },
+    });
+  }
+
+  async setExpoPushToken(userId: string, token: string | null) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { expoPushToken: token },
+    });
+  }
 }

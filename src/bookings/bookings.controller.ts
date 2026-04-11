@@ -1,15 +1,32 @@
-import { Controller, Get, Post, Put, Body, Param, Query, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Body,
+  Param,
+  Query,
+  UseGuards,
+  UseInterceptors,
+  UploadedFiles,
+  BadRequestException,
+} from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import { BookingsService } from './bookings.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { BookingStatus, UserRole } from '@prisma/client';
+import { CloudinaryService } from '../cloudinary/cloudinary.service';
 
 @Controller('bookings')
 @UseGuards(JwtAuthGuard)
 export class BookingsController {
-  constructor(private bookingsService: BookingsService) {}
+  constructor(
+    private bookingsService: BookingsService,
+    private cloudinaryService: CloudinaryService,
+  ) {}
 
   @Post()
   async create(@CurrentUser() user: any, @Body() data: {
@@ -20,17 +37,21 @@ export class BookingsController {
     locationLat?: number;
     locationLng?: number;
     locationAddress?: string;
+    photoUrls?: string[];
   }) {
     return this.bookingsService.create(user.id, data);
   }
 
   @Get('nearby-mechanics')
   async findNearbyMechanics(
+    @CurrentUser() user: any,
     @Query('lat') lat: string,
     @Query('lng') lng: string,
     @Query('faultCategory') faultCategory: string,
     @Query('radius') radius?: string,
     @Query('vehicleId') vehicleId?: string,
+    @Query('minRating') minRating?: string,
+    @Query('availableOnly') availableOnly?: string,
   ) {
     return this.bookingsService.findNearbyMechanics(
       parseFloat(lat),
@@ -38,6 +59,12 @@ export class BookingsController {
       faultCategory,
       radius ? parseFloat(radius) : 10,
       vehicleId,
+      {
+        userId: user.id,
+        minRating: minRating != null && minRating !== '' ? parseFloat(minRating) : undefined,
+        availableOnly:
+          availableOnly === '0' || availableOnly === 'false' ? false : undefined,
+      },
     );
   }
 
@@ -60,6 +87,56 @@ export class BookingsController {
       return this.bookingsService.findByMechanicId(user.id);
     }
     return this.bookingsService.findByUserId(user.id);
+  }
+
+  @Get(':id/receipt')
+  async getReceipt(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.bookingsService.getBookingReceipt(id, user.id, user.role);
+  }
+
+  @Post(':id/report')
+  async reportBooking(
+    @Param('id') id: string,
+    @CurrentUser() user: any,
+    @Body() body: { reason: string; details?: string },
+  ) {
+    const role = user.role === UserRole.MECHANIC ? 'MECHANIC' : 'USER';
+    return this.bookingsService.reportBooking(id, user.id, role, body.reason, body.details);
+  }
+
+  @Put(':id/dispute')
+  async dispute(
+    @Param('id') id: string,
+    @CurrentUser() user: any,
+    @Body() body: { reason: string },
+  ) {
+    return this.bookingsService.raiseDispute(id, user.id, user.role, body.reason);
+  }
+
+  @Put(':id/messages/read')
+  async markMessagesRead(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.bookingsService.markBookingMessagesRead(id, user.id);
+  }
+
+  @Post(':id/photos')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.USER)
+  @UseInterceptors(
+    FilesInterceptor('files', 5, {
+      limits: { fileSize: 3 * 1024 * 1024 },
+    }),
+  )
+  async uploadBookingPhotos(
+    @Param('id') id: string,
+    @CurrentUser() user: any,
+    @UploadedFiles() files: Express.Multer.File[],
+  ) {
+    if (!files?.length) throw new BadRequestException('No files uploaded');
+    const urls: string[] = [];
+    for (const file of files) {
+      urls.push(await this.cloudinaryService.uploadImage(file, 'booking-photos'));
+    }
+    return this.bookingsService.appendBookingPhotoUrls(id, user.id, urls);
   }
 
   @Get(':id')

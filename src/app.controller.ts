@@ -14,4 +14,16 @@ export class AppController {
   getHealth() {
     return { status: 'ok', timestamp: new Date().toISOString() };
   }
+
+  /** Public feature flags and client hints (no secrets). */
+  @Get('config/public')
+  getPublicConfig() {
+    return {
+      flags: {
+        paymentsEnabled: process.env.FEATURE_PAYMENTS !== '0',
+        emailNotifications: !!process.env.SMTP_HOST,
+        openRequestExpiryDays: 7,
+      },
+    };
+  }
 }
