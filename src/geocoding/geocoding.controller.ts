@@ -18,4 +18,13 @@ export class GeocodingController {
     const address = await this.geocodingService.reverseGeocode(latNum, lngNum);
     return { address };
   }
+
+  @Get('search')
+  async search(@Query('q') q: string): Promise<{ results: Array<{ lat: number; lng: number; label: string }> }> {
+    if (!q || q.trim().length < 3) {
+      throw new BadRequestException('Query must be at least 3 characters');
+    }
+    const results = await this.geocodingService.searchAddress(q.trim(), 5);
+    return { results };
+  }
 }

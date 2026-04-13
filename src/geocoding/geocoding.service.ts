@@ -1,6 +1,12 @@
 import { Injectable } from '@nestjs/common';
 
-const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
+const NOMINATIM_REVERSE = 'https://nominatim.openstreetmap.org/reverse';
+const NOMINATIM_SEARCH = 'https://nominatim.openstreetmap.org/search';
+
+const NOMINATIM_HEADERS = {
+  'Accept-Language': 'en',
+  'User-Agent': 'MechanicPlatform/1.0 (https://github.com/mechanic-platform)',
+} as const;
 
 /** Build a street-level address from Nominatim address details (e.g. "21 Main St, Ikeja, Lagos, Nigeria") */
 function formatAddressFromDetails(addr: Record<string, string>): string {
@@ -39,11 +45,8 @@ export class GeocodingService {
       zoom: '18', // building-level when OSM has it
       layer: 'address', // address points (house numbers, streets), not POIs
     });
-    const res = await fetch(`${NOMINATIM_URL}?${params}`, {
-      headers: {
-        'Accept-Language': 'en',
-        'User-Agent': 'MechanicPlatform/1.0 (https://github.com/mechanic-platform)',
-      },
+    const res = await fetch(`${NOMINATIM_REVERSE}?${params}`, {
+      headers: { ...NOMINATIM_HEADERS },
     });
     if (!res.ok) throw new Error('Could not get address');
     const data = await res.json();
@@ -59,5 +62,44 @@ export class GeocodingService {
     }
 
     return displayName ?? `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+  }
+
+  /** Forward geocode: free-text query → coordinates (for browsers without GPS). */
+  async searchAddress(
+    query: string,
+    limit = 5,
+  ): Promise<Array<{ lat: number; lng: number; label: string }>> {
+    const q = query.trim();
+    if (q.length < 3) return [];
+
+    const params = new URLSearchParams({
+      q,
+      format: 'json',
+      limit: String(Math.min(Math.max(limit, 1), 8)),
+      addressdetails: '1',
+    });
+    const res = await fetch(`${NOMINATIM_SEARCH}?${params}`, {
+      headers: { ...NOMINATIM_HEADERS },
+    });
+    if (!res.ok) throw new Error('Search failed');
+    const data = (await res.json()) as Array<{
+      lat: string;
+      lon: string;
+      display_name?: string;
+    }>;
+    if (!Array.isArray(data)) return [];
+
+    return data
+      .map((row) => {
+        const lat = parseFloat(row.lat);
+        const lng = parseFloat(row.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+        return {
+          lat,
+          lng,
+          label: row.display_name ?? `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
+        };
+      })
+      .filter((x): x is { lat: number; lng: number; label: string } => x !== null);
   }
 }

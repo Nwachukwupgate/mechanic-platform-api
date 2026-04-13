@@ -1,5 +1,16 @@
-import { IsOptional, IsString, IsNumber, IsArray, IsBoolean } from 'class-validator';
-import { Type } from 'class-transformer';
+import {
+  IsOptional,
+  IsString,
+  IsNumber,
+  IsArray,
+  IsBoolean,
+  IsInt,
+  Min,
+  Max,
+  MaxLength,
+  ValidateIf,
+} from 'class-validator';
+import { Type, Transform } from 'class-transformer';
 
 export class UpdateMechanicProfileDto {
   @IsOptional()
@@ -88,12 +99,24 @@ export class UpdateMechanicProfileDto {
   @IsString()
   nin?: string;
 
+  /** Reply-time expectation (hours). Null clears the field. */
   @IsOptional()
-  @IsNumber()
-  @Type(() => Number)
+  @Transform(({ value }) => {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return Math.trunc(n);
+  })
+  @ValidateIf((_, v) => v !== null && v !== undefined)
+  @IsInt()
+  @Min(1)
+  @Max(168)
   typicalResponseHours?: number | null;
 
   @IsOptional()
+  @Transform(({ value }) => (value === '' || value === undefined ? null : value))
+  @ValidateIf((_, v) => v !== null && v !== undefined)
   @IsString()
+  @MaxLength(500)
   nextAvailableNote?: string | null;
 }
