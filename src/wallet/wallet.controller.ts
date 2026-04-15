@@ -4,6 +4,7 @@ import {
   Post,
   Body,
   Query,
+  Param,
   UseGuards,
   ParseIntPipe,
   DefaultValuePipe,
@@ -19,6 +20,7 @@ import { InitializePaymentDto } from './dto/initialize-payment.dto';
 import { VerifyPaymentDto } from './dto/verify-payment.dto';
 import { MarkDirectPaidDto } from './dto/mark-direct-paid.dto';
 import { WithdrawDto } from './dto/withdraw.dto';
+import { RecordFeePaymentDto } from './dto/record-fee-payment.dto';
 import { TransactionType } from '@prisma/client';
 
 @Controller('wallet')
@@ -43,6 +45,18 @@ export class WalletController {
   async markDirectPaid(@CurrentUser() user: any, @Body() dto: MarkDirectPaidDto) {
     if (user.role !== UserRole.USER) throw new ForbiddenException('Only users can mark direct payment');
     return this.walletService.markDirectPaid(user.id, dto.bookingId);
+  }
+
+  // --- User / mechanic: single transaction detail ---
+  @Get('transactions/:id')
+  async getTransaction(@CurrentUser() user: any, @Param('id') id: string) {
+    if (user.role === UserRole.MECHANIC) {
+      return this.walletService.getMechanicTransactionById(user.id, id);
+    }
+    if (user.role === UserRole.USER) {
+      return this.walletService.getUserTransactionById(user.id, id);
+    }
+    throw new ForbiddenException('Wallet transactions are for users and mechanics only');
   }
 
   // --- User: My transactions ---
@@ -87,5 +101,18 @@ export class WalletController {
   @Post('withdraw')
   async withdraw(@CurrentUser() mechanic: any, @Body() dto: WithdrawDto) {
     return this.walletService.requestWithdrawal(mechanic.id, dto.amountMinor);
+  }
+
+  /** Mechanic: record platform fee paid (e.g. after customer paid you directly). Creates MECHANIC_FEE transaction. */
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('record-fee-payment')
+  async recordFeePayment(@CurrentUser() mechanic: any, @Body() dto: RecordFeePaymentDto) {
+    return this.walletService.recordMechanicFeePayment(
+      mechanic.id,
+      dto.amountMinor,
+      dto.bookingId,
+      dto.note,
+    );
   }
 }

@@ -1,5 +1,6 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHmac, timingSafeEqual } from 'crypto';
 
 const PAYSTACK_BASE = 'https://api.paystack.co';
 
@@ -26,6 +27,27 @@ export class PaystackService {
       throw new BadRequestException('Paystack is not configured');
     }
     return key;
+  }
+
+  /**
+   * Verify Paystack webhook `x-paystack-signature` (HMAC SHA512 of raw body).
+   * See https://paystack.com/docs/payments/webhooks/
+   */
+  verifyWebhookSignature(rawBody: Buffer, signatureHeader: string | undefined): boolean {
+    if (!signatureHeader || !Buffer.isBuffer(rawBody) || rawBody.length === 0) {
+      return false;
+    }
+    const key = this.configService.get<string>('PAYSTACK_SECRET_KEY');
+    if (!key) return false;
+    const expected = createHmac('sha512', key).update(rawBody).digest('hex');
+    try {
+      const a = Buffer.from(expected, 'hex');
+      const b = Buffer.from(signatureHeader, 'hex');
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
   }
 
   async initializeTransaction(

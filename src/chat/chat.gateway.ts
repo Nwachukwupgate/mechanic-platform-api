@@ -13,6 +13,7 @@ import { ChatService } from './chat.service';
 import { BookingsService } from '../bookings/bookings.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { BookingStatus } from '@prisma/client';
 
 @WebSocketGateway({
   cors: {
@@ -96,8 +97,28 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server?.to(`account:${payload.mechanicId}`).emit('quote:accepted', payload);
   }
 
+  /** Booking status updates (e.g. PAID after Paystack) — refresh lists/detail on user & mechanic apps. */
+  @OnEvent('booking.statusChanged')
+  handleBookingStatusChanged(payload: {
+    bookingId: string;
+    status: BookingStatus;
+    userId: string;
+    mechanicId: string | null;
+  }) {
+    this.server?.to(`account:${payload.userId}`).emit('booking:statusChanged', payload);
+    if (payload.mechanicId) {
+      this.server?.to(`account:${payload.mechanicId}`).emit('booking:statusChanged', payload);
+    }
+    this.server?.to(`booking:${payload.bookingId}`).emit('booking:statusChanged', payload);
+  }
+
   @SubscribeMessage('join_booking')
-  async handleJoinBooking(@ConnectedSocket() client: Socket, @MessageBody() bookingId: string) {
+  async handleJoinBooking(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: string | { bookingId?: string },
+  ) {
+    const bookingId = typeof body === 'string' ? body : body?.bookingId;
+    if (!bookingId || typeof bookingId !== 'string') return;
     client.join(`booking:${bookingId}`);
   }
 

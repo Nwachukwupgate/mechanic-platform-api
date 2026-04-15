@@ -19,6 +19,29 @@ export class UsersService {
     return user;
   }
 
+  /** User self profile with lightweight booking stats for profile / dashboard UI. */
+  async findByIdWithStats(id: string) {
+    const user = await this.findById(id);
+
+    const [totalBookings, completedBookings] = await Promise.all([
+      this.prisma.booking.count({ where: { userId: id } }),
+      this.prisma.booking.count({
+        where: {
+          userId: id,
+          status: { in: ['DONE', 'PAID', 'DELIVERED'] },
+        },
+      }),
+    ]);
+
+    return {
+      ...user,
+      stats: {
+        totalBookings,
+        completedBookings,
+      },
+    };
+  }
+
   async findByEmail(email: string) {
     return this.prisma.user.findUnique({
       where: { email },

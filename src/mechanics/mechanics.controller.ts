@@ -34,7 +34,7 @@ export class MechanicsController {
   @Roles(UserRole.MECHANIC)
   @Get('me/profile')
   async getMyProfile(@CurrentUser() mechanic: any) {
-    return this.mechanicsService.findById(mechanic.id);
+    return this.mechanicsService.getMyProfileWithStats(mechanic.id);
   }
 
   @UseGuards(JwtAuthGuard, RolesGuard)

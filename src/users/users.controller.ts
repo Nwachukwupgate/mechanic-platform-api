@@ -13,7 +13,7 @@ export class UsersController {
 
   @Get('me')
   async getMe(@CurrentUser() user: any) {
-    return this.usersService.findById(user.id);
+    return this.usersService.findByIdWithStats(user.id);
   }
 
   @Put('me/profile')

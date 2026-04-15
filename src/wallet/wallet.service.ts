@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma/prisma.service';
@@ -14,15 +15,19 @@ import {
   BookingStatus,
 } from '@prisma/client';
 import { randomBytes } from 'crypto';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 
 const PLATFORM_FEE_PERCENT = 20; // we take 20%, mechanic gets 80%
 
 @Injectable()
 export class WalletService {
+  private readonly logger = new Logger(WalletService.name);
+
   constructor(
     private prisma: PrismaService,
     private paystack: PaystackService,
     private configService: ConfigService,
+    private eventEmitter: EventEmitter2,
   ) {}
 
   /** User: Initialize Paystack payment for a booking (platform flow). */
@@ -46,7 +51,10 @@ export class WalletService {
     const amountKobo = amountNaira * 100;
     const reference = `bk_${bookingId}_${randomBytes(8).toString('hex')}`;
     const frontendUrl = this.configService.get<string>('FRONTEND_URL') || '';
-    const callbackUrl = frontendUrl ? `${frontendUrl.replace(/\/$/, '')}/user/wallet` : undefined;
+    // Paystack redirects here after payment with &reference= &trxref= appended. Include bookingId so the SPA can return to the booking.
+    const callbackUrl = frontendUrl
+      ? `${frontendUrl.replace(/\/$/, '')}/user/wallet?bookingId=${encodeURIComponent(bookingId)}`
+      : undefined;
 
     const result = await this.paystack.initializeTransaction(
       amountKobo,
@@ -80,49 +88,178 @@ export class WalletService {
     };
   }
 
-  /** User: Verify Paystack payment and mark booking as paid (platform flow). */
+  /** User: Verify Paystack payment and mark booking as paid (platform flow). Idempotent if already verified. */
   async verifyPayment(userId: string, reference: string) {
+    const paystackRef = reference.trim();
+    const alreadyDone = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.USER_PAYMENT,
+        status: TransactionStatus.SUCCESS,
+        paystackReference: paystackRef,
+        userId,
+      },
+    });
+    if (alreadyDone?.bookingId) {
+      const booking = await this.prisma.booking.findUnique({
+        where: { id: alreadyDone.bookingId },
+        include: { mechanic: true, vehicle: true, fault: true },
+      });
+      return { success: true, booking, alreadyVerified: true as const };
+    }
+
     const pending = await this.prisma.transaction.findFirst({
       where: {
         type: TransactionType.USER_PAYMENT,
         status: TransactionStatus.PENDING,
-        paystackReference: reference,
+        paystackReference: paystackRef,
         userId,
       },
-      include: { booking: true },
     });
-    if (!pending) throw new NotFoundException('Payment not found or already processed');
-
-    const verify = await this.paystack.verifyTransaction(reference);
-    if (!verify || verify.status !== 'success') {
-      throw new BadRequestException('Payment verification failed or not successful');
+    if (!pending) {
+      this.logger.warn(`verifyPayment: no pending tx userId=${userId} ref=${paystackRef}`);
+      throw new NotFoundException('Payment not found or already processed');
     }
 
-    const bookingId = pending.bookingId!;
-    const amountNaira = verify.amount / 100;
-
-    await this.prisma.$transaction([
-      this.prisma.transaction.update({
-        where: { id: pending.id },
-        data: { status: TransactionStatus.SUCCESS },
-      }),
-      this.prisma.booking.update({
-        where: { id: bookingId },
-        data: {
-          paidAt: new Date(),
-          paymentMethod: PaymentMethod.PLATFORM,
-          paidAmount: amountNaira,
-          paystackReference: reference,
-          status: BookingStatus.PAID,
+    const result = await this.finalizePendingUserPaymentWithPaystackVerify(paystackRef, pending.id);
+    if (result.duplicate) {
+      const booking = await this.prisma.booking.findFirst({
+        where: {
+          id: pending.bookingId!,
+          userId,
         },
-      }),
-    ]);
+        include: { mechanic: true, vehicle: true, fault: true },
+      });
+      return { success: true, booking, alreadyVerified: true as const };
+    }
+    if (!result.applied) {
+      if (result.reason === 'verify_failed') {
+        this.logger.warn(`verifyPayment: Paystack verify not success ref=${paystackRef}`);
+        throw new BadRequestException('Payment verification failed or not successful');
+      }
+      if (result.reason === 'db_error') {
+        throw new BadRequestException('Could not confirm payment. Try again or contact support.');
+      }
+      const fallback = await this.prisma.transaction.findFirst({
+        where: {
+          type: TransactionType.USER_PAYMENT,
+          status: TransactionStatus.SUCCESS,
+          paystackReference: paystackRef,
+          userId,
+        },
+      });
+      if (fallback?.bookingId) {
+        const booking = await this.prisma.booking.findUnique({
+          where: { id: fallback.bookingId },
+          include: { mechanic: true, vehicle: true, fault: true },
+        });
+        return { success: true, booking, alreadyVerified: true as const };
+      }
+      throw new NotFoundException('Payment not found or already processed');
+    }
 
     const booking = await this.prisma.booking.findUnique({
-      where: { id: bookingId },
+      where: { id: pending.bookingId! },
       include: { mechanic: true, vehicle: true, fault: true },
     });
     return { success: true, booking };
+  }
+
+  /**
+   * Called from Paystack `charge.success` webhook when the user never hits our redirect URL.
+   * Idempotent and safe under concurrent client verify + webhook.
+   */
+  async finalizePaystackUserPaymentFromWebhook(paystackReference: string): Promise<{
+    applied: boolean;
+    duplicate?: boolean;
+    reason?: string;
+  }> {
+    return this.finalizePendingUserPaymentWithPaystackVerify(paystackReference.trim());
+  }
+
+  /**
+   * Confirm pending USER_PAYMENT: verify with Paystack API, then atomically flip tx + booking to paid.
+   */
+  private async finalizePendingUserPaymentWithPaystackVerify(
+    paystackRef: string,
+    expectedPendingId?: string,
+  ): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
+    const successRow = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.USER_PAYMENT,
+        status: TransactionStatus.SUCCESS,
+        paystackReference: paystackRef,
+      },
+    });
+    if (successRow) {
+      return { applied: false, duplicate: true };
+    }
+
+    const pending = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.USER_PAYMENT,
+        status: TransactionStatus.PENDING,
+        paystackReference: paystackRef,
+        ...(expectedPendingId ? { id: expectedPendingId } : {}),
+      },
+    });
+    if (!pending?.bookingId) {
+      this.logger.warn(`finalize Paystack: no pending USER_PAYMENT ref=${paystackRef}`);
+      return { applied: false, reason: 'no_pending' };
+    }
+
+    const verify = await this.paystack.verifyTransaction(paystackRef);
+    if (!verify || verify.status !== 'success') {
+      this.logger.warn(`finalize Paystack: verify API not success ref=${paystackRef}`);
+      return { applied: false, reason: 'verify_failed' };
+    }
+
+    const amountNaira = verify.amount / 100;
+    const bookingId = pending.bookingId;
+    const pendingId = pending.id;
+
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.transaction.updateMany({
+          where: { id: pendingId, status: TransactionStatus.PENDING },
+          data: { status: TransactionStatus.SUCCESS },
+        });
+        if (updated.count === 0) {
+          return;
+        }
+        await tx.booking.update({
+          where: { id: bookingId },
+          data: {
+            paidAt: new Date(),
+            paymentMethod: PaymentMethod.PLATFORM,
+            paidAmount: amountNaira,
+            paystackReference: paystackRef,
+            status: BookingStatus.PAID,
+          },
+        });
+      });
+    } catch (e) {
+      this.logger.error(`finalize Paystack: DB error ref=${paystackRef} ${String(e)}`);
+      return { applied: false, reason: 'db_error' };
+    }
+
+    const confirmed = await this.prisma.transaction.findFirst({
+      where: { id: pendingId, status: TransactionStatus.SUCCESS },
+    });
+    if (!confirmed) {
+      return { applied: false, duplicate: true };
+    }
+
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (booking) {
+      this.eventEmitter.emit('booking.statusChanged', {
+        bookingId: booking.id,
+        status: BookingStatus.PAID,
+        userId: booking.userId,
+        mechanicId: booking.mechanicId,
+      });
+    }
+    this.logger.log(`USER_PAYMENT finalized ref=${paystackRef} bookingId=${bookingId}`);
+    return { applied: true };
   }
 
   /** User: Mark booking as paid directly to mechanic (direct flow). */
@@ -136,7 +273,7 @@ export class WalletService {
     const amount = booking.estimatedCost ?? booking.actualCost ?? 0;
     if (amount <= 0) throw new BadRequestException('Booking has no cost');
 
-    await this.prisma.booking.update({
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: {
         paidAt: new Date(),
@@ -144,6 +281,13 @@ export class WalletService {
         paidAmount: amount,
         status: BookingStatus.PAID,
       },
+    });
+
+    this.eventEmitter.emit('booking.statusChanged', {
+      bookingId: updated.id,
+      status: BookingStatus.PAID,
+      userId: updated.userId,
+      mechanicId: updated.mechanicId,
     });
 
     return this.prisma.booking.findUnique({
@@ -285,7 +429,16 @@ export class WalletService {
         take: Math.min(limit, 100),
         skip: offset,
         include: {
-          booking: { select: { id: true, status: true, vehicle: true, fault: true } },
+          booking: {
+            select: {
+              id: true,
+              status: true,
+              paidAmount: true,
+              paymentMethod: true,
+              vehicle: true,
+              fault: true,
+            },
+          },
           user: { select: { id: true, email: true } },
         },
       }),
@@ -313,17 +466,277 @@ export class WalletService {
     };
   }
 
-  /** Mechanic: Full wallet summary (balance, owing, recent transactions). */
+  /** Mechanic: Full wallet summary — single net balance + breakdown + recent transactions. */
   async getMechanicWalletSummary(mechanicId: string) {
     const [balance, owing, recent] = await Promise.all([
       this.getMechanicBalance(mechanicId),
       this.getMechanicOwing(mechanicId),
-      this.listMechanicTransactions(mechanicId, { limit: 10 }),
+      this.listMechanicTransactions(mechanicId, { limit: 20 }),
     ]);
+    const netMinor = balance.balanceMinor - owing.owingMinor;
     return {
-      balance,
-      owing,
+      balance: {
+        netMinor,
+        netNaira: netMinor / 100,
+        availableToWithdrawMinor: balance.balanceMinor,
+        availableToWithdrawNaira: balance.balanceNaira,
+        unpaidPlatformFeeMinor: owing.owingMinor,
+        unpaidPlatformFeeNaira: owing.owingNaira,
+        totalEarnedFromPlatformMinor: balance.totalEarnedFromPlatformMinor,
+        totalPayoutsMinor: balance.totalPayoutsMinor,
+        totalFeeOwedMinor: owing.totalFeeOwedMinor,
+        totalFeePaidMinor: owing.totalFeePaidMinor,
+        currency: 'NGN',
+      },
       recentTransactions: recent.items,
+    };
+  }
+
+  /** Mechanic: record a platform fee payment (e.g. after customer paid them directly). */
+  async recordMechanicFeePayment(
+    mechanicId: string,
+    amountMinor: number,
+    bookingId?: string,
+    note?: string,
+  ) {
+    if (amountMinor < 100) {
+      throw new BadRequestException('Minimum amount is \u20A61 (100 kobo)');
+    }
+    const owing = await this.getMechanicOwing(mechanicId);
+
+    if (bookingId) {
+      const booking = await this.prisma.booking.findFirst({
+        where: { id: bookingId, mechanicId },
+      });
+      if (!booking) throw new NotFoundException('Booking not found');
+      if (booking.paymentMethod !== PaymentMethod.DIRECT) {
+        throw new BadRequestException('Fee payments can only be allocated to direct-paid bookings');
+      }
+      if (!booking.paidAt || booking.paidAmount == null) {
+        throw new BadRequestException('Booking must be marked paid');
+      }
+      const feeOwedMinor = Math.round((booking.paidAmount ?? 0) * 100 * (PLATFORM_FEE_PERCENT / 100));
+      const paidAgg = await this.prisma.transaction.aggregate({
+        where: {
+          mechanicId,
+          bookingId,
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.SUCCESS,
+        },
+        _sum: { amountMinor: true },
+      });
+      const alreadyMinor = paidAgg._sum.amountMinor ?? 0;
+      const remainingMinor = Math.max(0, feeOwedMinor - alreadyMinor);
+      if (amountMinor > remainingMinor) {
+        throw new BadRequestException(
+          `Amount exceeds remaining fee for this booking (\u20A6${(remainingMinor / 100).toLocaleString()} left)`,
+        );
+      }
+    } else {
+      if (amountMinor > owing.owingMinor) {
+        throw new BadRequestException(
+          `Amount exceeds total platform fee owed (\u20A6${(owing.owingMinor / 100).toLocaleString()})`,
+        );
+      }
+    }
+
+    const reference = `fee_${randomBytes(8).toString('hex')}`;
+    return this.prisma.transaction.create({
+      data: {
+        type: TransactionType.MECHANIC_FEE,
+        amountMinor,
+        currency: 'NGN',
+        status: TransactionStatus.SUCCESS,
+        reference,
+        mechanicId,
+        bookingId: bookingId ?? undefined,
+        description:
+          note?.trim() ||
+          (bookingId
+            ? `Platform fee (${PLATFORM_FEE_PERCENT}%) — direct job`
+            : `Platform fee payment (${PLATFORM_FEE_PERCENT}% on direct jobs)`),
+        metadata: { source: 'mechanic_recorded', platformFeePercent: PLATFORM_FEE_PERCENT },
+      },
+    });
+  }
+
+  private enrichTransactionForDetail(t: any) {
+    const b = t.booking;
+    const grossNaira = b?.paidAmount != null ? Number(b.paidAmount) : null;
+    let feeSplit:
+      | {
+          grossNaira: number;
+          platformFeePercent: number;
+          mechanicSharePercent: number;
+          platformKeepsNaira: number | null;
+          mechanicShareNaira: number | null;
+          directFeeOwedNaira: number | null;
+        }
+      | undefined;
+
+    if (b && grossNaira != null && grossNaira > 0) {
+      const grossMinor = Math.round(grossNaira * 100);
+      const platformKeepsMinor = Math.round(grossMinor * (PLATFORM_FEE_PERCENT / 100));
+      const mechanicShareMinor = grossMinor - platformKeepsMinor;
+      if (b.paymentMethod === PaymentMethod.PLATFORM) {
+        feeSplit = {
+          grossNaira,
+          platformFeePercent: PLATFORM_FEE_PERCENT,
+          mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
+          platformKeepsNaira: platformKeepsMinor / 100,
+          mechanicShareNaira: mechanicShareMinor / 100,
+          directFeeOwedNaira: null,
+        };
+      } else if (b.paymentMethod === PaymentMethod.DIRECT) {
+        feeSplit = {
+          grossNaira,
+          platformFeePercent: PLATFORM_FEE_PERCENT,
+          mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
+          platformKeepsNaira: null,
+          mechanicShareNaira: grossNaira,
+          directFeeOwedNaira: platformKeepsMinor / 100,
+        };
+      }
+    }
+
+    const lines: { label: string; value: string }[] = [];
+    if (t.type === TransactionType.PLATFORM_PAYOUT) {
+      lines.push({ label: 'Type', value: 'Withdrawal / payout to your bank' });
+    } else if (t.type === TransactionType.MECHANIC_FEE) {
+      lines.push({
+        label: 'Type',
+        value: `Platform fee (${PLATFORM_FEE_PERCENT}% on direct customer payments)`,
+      });
+    } else if (t.type === TransactionType.USER_PAYMENT) {
+      lines.push({ label: 'Type', value: 'Customer payment via platform' });
+    } else if (t.type === TransactionType.REFUND) {
+      lines.push({ label: 'Type', value: 'Refund' });
+    }
+
+    if (feeSplit) {
+      lines.push({
+        label: 'Job amount (customer)',
+        value: `\u20A6${feeSplit.grossNaira.toLocaleString()}`,
+      });
+      if (feeSplit.platformKeepsNaira != null) {
+        lines.push({
+          label: 'Platform retains',
+          value: `\u20A6${feeSplit.platformKeepsNaira.toLocaleString()} (${PLATFORM_FEE_PERCENT}%)`,
+        });
+      }
+      if (feeSplit.mechanicShareNaira != null && t.type !== TransactionType.MECHANIC_FEE) {
+        lines.push({
+          label: 'Your share (accrued)',
+          value: `\u20A6${feeSplit.mechanicShareNaira.toLocaleString()} (${100 - PLATFORM_FEE_PERCENT}%)`,
+        });
+      }
+      if (feeSplit.directFeeOwedNaira != null) {
+        lines.push({
+          label: 'Platform fee owed on this job',
+          value: `\u20A6${feeSplit.directFeeOwedNaira.toLocaleString()}`,
+        });
+      }
+    }
+
+    return {
+      id: t.id,
+      type: t.type,
+      amountMinor: t.amountMinor,
+      amountNaira: t.amountMinor / 100,
+      currency: t.currency,
+      status: t.status,
+      reference: t.reference,
+      paystackReference: t.paystackReference,
+      description: t.description,
+      bookingId: t.bookingId,
+      metadata: t.metadata,
+      createdAt: t.createdAt,
+      booking: t.booking,
+      user: t.user,
+      feeSplit,
+      detailLines: lines,
+    };
+  }
+
+  async getMechanicTransactionById(mechanicId: string, id: string) {
+    const t = await this.prisma.transaction.findFirst({
+      where: { id, mechanicId },
+      include: {
+        booking: {
+          include: {
+            vehicle: true,
+            fault: true,
+            user: { select: { id: true, email: true, firstName: true, lastName: true } },
+          },
+        },
+        user: { select: { id: true, email: true } },
+      },
+    });
+    if (!t) throw new NotFoundException('Transaction not found');
+    return this.enrichTransactionForDetail(t);
+  }
+
+  async getUserTransactionById(userId: string, id: string) {
+    const t = await this.prisma.transaction.findFirst({
+      where: { id, userId },
+      include: {
+        booking: {
+          include: {
+            vehicle: true,
+            fault: true,
+            mechanic: { select: { id: true, companyName: true } },
+          },
+        },
+        mechanic: { select: { id: true, companyName: true } },
+      },
+    });
+    if (!t) throw new NotFoundException('Transaction not found');
+    const grossNaira = t.booking?.paidAmount != null ? Number(t.booking.paidAmount) : null;
+    const feeSplit =
+      t.booking && grossNaira != null && grossNaira > 0
+        ? {
+            grossNaira,
+            platformFeePercent: PLATFORM_FEE_PERCENT,
+            mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
+            platformKeepsNaira: Math.round(grossNaira * 100 * (PLATFORM_FEE_PERCENT / 100)) / 100,
+            mechanicShareNaira: Math.round(grossNaira * 100 * (1 - PLATFORM_FEE_PERCENT / 100)) / 100,
+          }
+        : undefined;
+    return {
+      id: t.id,
+      type: t.type,
+      amountMinor: t.amountMinor,
+      amountNaira: t.amountMinor / 100,
+      currency: t.currency,
+      status: t.status,
+      reference: t.reference,
+      paystackReference: t.paystackReference,
+      description: t.description,
+      bookingId: t.bookingId,
+      metadata: t.metadata,
+      createdAt: t.createdAt,
+      booking: t.booking,
+      mechanic: t.mechanic,
+      feeSplit,
+      detailLines: [
+        {
+          label: 'Type',
+          value:
+            t.type === TransactionType.USER_PAYMENT ? 'Payment for booking' : String(t.type),
+        },
+        ...(feeSplit
+          ? [
+              {
+                label: 'Total charged',
+                value: `\u20A6${feeSplit.grossNaira.toLocaleString()}`,
+              },
+              {
+                label: 'Platform & mechanic split',
+                value: `${PLATFORM_FEE_PERCENT}% / ${100 - PLATFORM_FEE_PERCENT}%`,
+              },
+            ]
+          : []),
+      ],
     };
   }
 

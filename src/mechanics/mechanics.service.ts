@@ -130,6 +130,51 @@ export class MechanicsService {
     return mechanic;
   }
 
+  /**
+   * Mechanic self-service profile payload with engagement stats for dashboard / profile UI.
+   */
+  async getMyProfileWithStats(mechanicId: string) {
+    const mechanic = await this.findById(mechanicId);
+
+    const [ratingAgg, jobsCompleted, quoteGroups] = await Promise.all([
+      this.prisma.rating.aggregate({
+        where: { mechanicId },
+        _avg: { rating: true },
+        _count: { _all: true },
+      }),
+      this.prisma.booking.count({
+        where: {
+          mechanicId,
+          status: { in: ['DONE', 'PAID', 'DELIVERED'] },
+        },
+      }),
+      this.prisma.bookingQuote.groupBy({
+        by: ['status'],
+        where: { mechanicId },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const totalQuotes = quoteGroups.reduce((s, g) => s + g._count._all, 0);
+    const acceptedQuotes =
+      quoteGroups.find((g) => g.status === 'ACCEPTED')?._count._all ?? 0;
+    const quoteWinRate =
+      totalQuotes > 0 ? Math.round((acceptedQuotes / totalQuotes) * 100) : null;
+
+    return {
+      ...mechanic,
+      stats: {
+        averageRating:
+          ratingAgg._count._all > 0 && ratingAgg._avg.rating != null
+            ? Math.round(ratingAgg._avg.rating * 10) / 10
+            : null,
+        ratingCount: ratingAgg._count._all,
+        jobsCompleted,
+        quoteWinRate,
+      },
+    };
+  }
+
   async findByEmail(email: string) {
     return this.prisma.mechanic.findUnique({
       where: { email },
