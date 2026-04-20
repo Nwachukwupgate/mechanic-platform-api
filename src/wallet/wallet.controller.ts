@@ -115,4 +115,25 @@ export class WalletController {
       dto.note,
     );
   }
+
+  /** Mechanic: Start Paystack checkout to pay platform fee (20% on direct-paid jobs). */
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('initialize-mechanic-fee-payment')
+  async initializeMechanicFeePayment(@CurrentUser() mechanic: any, @Body() dto: RecordFeePaymentDto) {
+    return this.walletService.initializeMechanicFeePayment(
+      mechanic.id,
+      dto.amountMinor,
+      dto.bookingId,
+      dto.note,
+    );
+  }
+
+  /** Mechanic: Confirm Paystack platform fee payment after redirect / app resume. */
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('verify-mechanic-fee-payment')
+  async verifyMechanicFeePayment(@CurrentUser() mechanic: any, @Body() dto: VerifyPaymentDto) {
+    return this.walletService.verifyMechanicFeePayment(mechanic.id, dto.reference);
+  }
 }

@@ -43,8 +43,10 @@ export class PaystackWebhookController {
     if (payload.event === 'charge.success' && payload.data?.reference) {
       const ref = String(payload.data.reference).trim();
       try {
-        const out = await this.walletService.finalizePaystackUserPaymentFromWebhook(ref);
-        this.logger.log(`charge.success reference=${ref} result=${JSON.stringify(out)}`);
+        const userOut = await this.walletService.finalizePaystackUserPaymentFromWebhook(ref);
+        this.logger.log(`charge.success user ref=${ref} result=${JSON.stringify(userOut)}`);
+        const mechOut = await this.walletService.finalizePaystackMechanicFeeFromWebhook(ref);
+        this.logger.log(`charge.success mechanic ref=${ref} result=${JSON.stringify(mechOut)}`);
       } catch (e) {
         this.logger.error(`charge.success handler error reference=${ref} ${String(e)}`);
       }

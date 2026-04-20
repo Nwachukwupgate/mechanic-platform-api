@@ -492,16 +492,19 @@ export class WalletService {
     };
   }
 
-  /** Mechanic: record a platform fee payment (e.g. after customer paid them directly). */
-  async recordMechanicFeePayment(
+  /**
+   * Validates mechanic platform fee amount against direct-job owing and pending Paystack checkouts.
+   * Used by manual fee recording and Paystack initialize.
+   */
+  private async assertMechanicFeePaymentAllowed(
     mechanicId: string,
     amountMinor: number,
     bookingId?: string,
-    note?: string,
-  ) {
+  ): Promise<void> {
     if (amountMinor < 100) {
       throw new BadRequestException('Minimum amount is \u20A61 (100 kobo)');
     }
+
     const owing = await this.getMechanicOwing(mechanicId);
 
     if (bookingId) {
@@ -525,7 +528,17 @@ export class WalletService {
         },
         _sum: { amountMinor: true },
       });
-      const alreadyMinor = paidAgg._sum.amountMinor ?? 0;
+      const pendingAgg = await this.prisma.transaction.aggregate({
+        where: {
+          mechanicId,
+          bookingId,
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.PENDING,
+        },
+        _sum: { amountMinor: true },
+      });
+      const alreadyMinor =
+        (paidAgg._sum.amountMinor ?? 0) + (pendingAgg._sum.amountMinor ?? 0);
       const remainingMinor = Math.max(0, feeOwedMinor - alreadyMinor);
       if (amountMinor > remainingMinor) {
         throw new BadRequestException(
@@ -533,12 +546,243 @@ export class WalletService {
         );
       }
     } else {
-      if (amountMinor > owing.owingMinor) {
+      const pendingAll = await this.prisma.transaction.aggregate({
+        where: {
+          mechanicId,
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.PENDING,
+        },
+        _sum: { amountMinor: true },
+      });
+      const reservedMinor = pendingAll._sum.amountMinor ?? 0;
+      const availableMinor = Math.max(0, owing.owingMinor - reservedMinor);
+      if (amountMinor > availableMinor) {
         throw new BadRequestException(
-          `Amount exceeds total platform fee owed (\u20A6${(owing.owingMinor / 100).toLocaleString()})`,
+          availableMinor <= 0
+            ? 'You already have a pending platform fee checkout. Complete or cancel it before starting another.'
+            : `Amount exceeds available capacity (\u20A6${(availableMinor / 100).toLocaleString()}). Pending checkouts reduce what you can start.`,
         );
       }
     }
+  }
+
+  /** Mechanic: Initialize Paystack payment for platform fee (direct-job 20%). */
+  async initializeMechanicFeePayment(
+    mechanicId: string,
+    amountMinor: number,
+    bookingId?: string,
+    note?: string,
+  ) {
+    await this.assertMechanicFeePaymentAllowed(mechanicId, amountMinor, bookingId);
+
+    const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
+    if (!mechanic) throw new NotFoundException('Mechanic not found');
+
+    const reference = `mfee_${randomBytes(12).toString('hex')}`;
+    const frontendUrl = this.configService.get<string>('FRONTEND_URL') || '';
+    const callbackUrl = frontendUrl
+      ? `${frontendUrl.replace(/\/$/, '')}/mechanic/wallet`
+      : undefined;
+
+    const result = await this.paystack.initializeTransaction(
+      amountMinor,
+      mechanic.email,
+      reference,
+      {
+        mechanicId,
+        bookingId: bookingId ?? null,
+        kind: 'mechanic_platform_fee',
+      },
+      callbackUrl,
+    );
+
+    const description =
+      note?.trim() ||
+      (bookingId
+        ? `Platform fee (${PLATFORM_FEE_PERCENT}%) — direct job`
+        : `Platform fee (${PLATFORM_FEE_PERCENT}% on direct jobs)`);
+
+    await this.prisma.transaction.create({
+      data: {
+        type: TransactionType.MECHANIC_FEE,
+        amountMinor,
+        currency: 'NGN',
+        status: TransactionStatus.PENDING,
+        reference,
+        paystackReference: result.reference,
+        mechanicId,
+        bookingId: bookingId ?? undefined,
+        description,
+        metadata: {
+          source: 'paystack_pending',
+          platformFeePercent: PLATFORM_FEE_PERCENT,
+          ...(note?.trim() ? { note: note.trim() } : {}),
+          authorization_url: result.authorization_url,
+        },
+      },
+    });
+
+    return {
+      authorizationUrl: result.authorization_url,
+      accessCode: result.access_code,
+      reference: result.reference,
+    };
+  }
+
+  /** Mechanic: Verify Paystack payment for platform fee. Idempotent if already SUCCESS. */
+  async verifyMechanicFeePayment(mechanicId: string, reference: string) {
+    const paystackRef = reference.trim();
+    const alreadyDone = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.SUCCESS,
+        paystackReference: paystackRef,
+        mechanicId,
+      },
+    });
+    if (alreadyDone) {
+      return { success: true, alreadyVerified: true as const };
+    }
+
+    const pending = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.PENDING,
+        paystackReference: paystackRef,
+        mechanicId,
+      },
+    });
+    if (!pending) {
+      this.logger.warn(`verifyMechanicFeePayment: no pending tx mechanicId=${mechanicId} ref=${paystackRef}`);
+      throw new NotFoundException('Payment not found or already processed');
+    }
+
+    const result = await this.finalizePendingMechanicFeeWithPaystackVerify(paystackRef, pending.id);
+    if (result.duplicate) {
+      return { success: true, alreadyVerified: true as const };
+    }
+    if (!result.applied) {
+      if (result.reason === 'verify_failed') {
+        this.logger.warn(`verifyMechanicFeePayment: Paystack verify not success ref=${paystackRef}`);
+        throw new BadRequestException('Payment verification failed or not successful');
+      }
+      if (result.reason === 'amount_mismatch') {
+        throw new BadRequestException('Paid amount does not match checkout. Contact support.');
+      }
+      if (result.reason === 'db_error') {
+        throw new BadRequestException('Could not confirm payment. Try again or contact support.');
+      }
+      const fallback = await this.prisma.transaction.findFirst({
+        where: {
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.SUCCESS,
+          paystackReference: paystackRef,
+          mechanicId,
+        },
+      });
+      if (fallback) {
+        return { success: true, alreadyVerified: true as const };
+      }
+      throw new NotFoundException('Payment not found or already processed');
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Webhook / internal: finalize MECHANIC_FEE after Paystack charge.success (when app verify is skipped).
+   */
+  async finalizePaystackMechanicFeeFromWebhook(paystackReference: string): Promise<{
+    applied: boolean;
+    duplicate?: boolean;
+    reason?: string;
+  }> {
+    return this.finalizePendingMechanicFeeWithPaystackVerify(paystackReference.trim());
+  }
+
+  private async finalizePendingMechanicFeeWithPaystackVerify(
+    paystackRef: string,
+    expectedPendingId?: string,
+  ): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
+    const successRow = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.SUCCESS,
+        paystackReference: paystackRef,
+      },
+    });
+    if (successRow) {
+      return { applied: false, duplicate: true };
+    }
+
+    const pending = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.PENDING,
+        paystackReference: paystackRef,
+        ...(expectedPendingId ? { id: expectedPendingId } : {}),
+      },
+    });
+    if (!pending) {
+      this.logger.warn(`finalize mechanic fee: no pending MECHANIC_FEE ref=${paystackRef}`);
+      return { applied: false, reason: 'no_pending' };
+    }
+
+    const verify = await this.paystack.verifyTransaction(paystackRef);
+    if (!verify || verify.status !== 'success') {
+      this.logger.warn(`finalize mechanic fee: verify API not success ref=${paystackRef}`);
+      return { applied: false, reason: 'verify_failed' };
+    }
+
+    if (verify.amount !== pending.amountMinor) {
+      this.logger.warn(
+        `finalize mechanic fee: amount mismatch ref=${paystackRef} expected=${pending.amountMinor} got=${verify.amount}`,
+      );
+      return { applied: false, reason: 'amount_mismatch' };
+    }
+
+    const pendingId = pending.id;
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.transaction.updateMany({
+          where: { id: pendingId, status: TransactionStatus.PENDING },
+          data: {
+            status: TransactionStatus.SUCCESS,
+            metadata: {
+              ...((pending.metadata as object) || {}),
+              source: 'paystack',
+              verifiedAt: new Date().toISOString(),
+            },
+          },
+        });
+        if (updated.count === 0) {
+          return;
+        }
+      });
+    } catch (e) {
+      this.logger.error(`finalize mechanic fee: DB error ref=${paystackRef} ${String(e)}`);
+      return { applied: false, reason: 'db_error' };
+    }
+
+    const confirmed = await this.prisma.transaction.findFirst({
+      where: { id: pendingId, status: TransactionStatus.SUCCESS },
+    });
+    if (!confirmed) {
+      return { applied: false, duplicate: true };
+    }
+
+    this.logger.log(`MECHANIC_FEE finalized ref=${paystackRef} mechanicId=${pending.mechanicId}`);
+    return { applied: true };
+  }
+
+  /** Mechanic: record a platform fee payment (e.g. after customer paid them directly). */
+  async recordMechanicFeePayment(
+    mechanicId: string,
+    amountMinor: number,
+    bookingId?: string,
+    note?: string,
+  ) {
+    await this.assertMechanicFeePaymentAllowed(mechanicId, amountMinor, bookingId);
 
     const reference = `fee_${randomBytes(8).toString('hex')}`;
     return this.prisma.transaction.create({
