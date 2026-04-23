@@ -136,4 +136,15 @@ export class WalletController {
   async verifyMechanicFeePayment(@CurrentUser() mechanic: any, @Body() dto: VerifyPaymentDto) {
     return this.walletService.verifyMechanicFeePayment(mechanic.id, dto.reference);
   }
+
+  /**
+   * Mechanic: Cancel an abandoned platform-fee checkout (after Paystack confirms it did not succeed).
+   * If the charge actually succeeded, the server finalizes the payment instead.
+   */
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Post('cancel-mechanic-fee-checkout')
+  async cancelMechanicFeeCheckout(@CurrentUser() mechanic: any, @Body() dto: VerifyPaymentDto) {
+    return this.walletService.cancelMechanicFeeCheckout(mechanic.id, dto.reference);
+  }
 }

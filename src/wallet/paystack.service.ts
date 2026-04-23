@@ -200,4 +200,41 @@ export class PaystackService {
       status: data.data.status ?? 'pending',
     };
   }
+
+  /**
+   * Fetch a single transfer by Paystack transfer code (e.g. TRF_xxx) for fees / status reconciliation.
+   * @see https://paystack.com/docs/api/transfer/#fetch
+   */
+  async fetchTransfer(transferCode: string): Promise<{
+    reference: string;
+    amount: number;
+    status: string;
+    feeCharged: number;
+    transferCode: string;
+  } | null> {
+    const code = transferCode.trim();
+    if (!code) return null;
+    const res = await fetch(`${PAYSTACK_BASE}/transfer/${encodeURIComponent(code)}`, {
+      headers: { Authorization: `Bearer ${this.getSecretKey()}` },
+    });
+    const data = (await res.json()) as {
+      status: boolean;
+      data?: {
+        reference: string;
+        amount: number;
+        status: string;
+        fee_charged?: number;
+        transfer_code?: string;
+      };
+    };
+    if (!data.status || !data.data) return null;
+    const d = data.data;
+    return {
+      reference: d.reference,
+      amount: d.amount,
+      status: d.status,
+      feeCharged: typeof d.fee_charged === 'number' ? d.fee_charged : 0,
+      transferCode: d.transfer_code ?? code,
+    };
+  }
 }

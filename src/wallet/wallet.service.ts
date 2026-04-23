@@ -3,12 +3,15 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  ConflictException,
+  ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { PaystackService } from './paystack.service';
 import {
+  Prisma,
   TransactionType,
   TransactionStatus,
   PaymentMethod,
@@ -341,9 +344,13 @@ export class WalletService {
     };
   }
 
-  /** Mechanic: Balance we owe them (80% of platform-paid bookings minus payouts). */
-  async getMechanicBalance(mechanicId: string) {
-    const platformPaid = await this.prisma.booking.findMany({
+  /**
+   * Mechanic: Balance we owe them (80% of platform-paid bookings minus payouts).
+   * Pass `tx` inside a Serializable transaction so concurrent withdrawals see a consistent snapshot.
+   */
+  async getMechanicBalance(mechanicId: string, tx?: Prisma.TransactionClient) {
+    const db = tx ?? this.prisma;
+    const platformPaid = await db.booking.findMany({
       where: {
         mechanicId,
         paymentMethod: PaymentMethod.PLATFORM,
@@ -352,21 +359,33 @@ export class WalletService {
       },
       select: { paidAmount: true },
     });
-    const payouts = await this.prisma.transaction.findMany({
-      where: {
-        mechanicId,
-        type: TransactionType.PLATFORM_PAYOUT,
-        status: TransactionStatus.SUCCESS,
-      },
-      select: { amountMinor: true },
-    });
+    const [payoutsSuccess, pendingWithdrawAgg] = await Promise.all([
+      db.transaction.findMany({
+        where: {
+          mechanicId,
+          type: TransactionType.PLATFORM_PAYOUT,
+          status: TransactionStatus.SUCCESS,
+        },
+        select: { amountMinor: true },
+      }),
+      db.transaction.aggregate({
+        where: {
+          mechanicId,
+          type: TransactionType.PLATFORM_PAYOUT,
+          status: TransactionStatus.PENDING,
+        },
+        _sum: { amountMinor: true },
+      }),
+    ]);
 
     const totalEarnedMinor = platformPaid.reduce(
       (sum, b) => sum + Math.round((b.paidAmount ?? 0) * 100 * (1 - PLATFORM_FEE_PERCENT / 100)),
       0,
     );
-    const totalPayoutMinor = payouts.reduce((sum, t) => sum + t.amountMinor, 0);
-    const balanceMinor = Math.max(0, totalEarnedMinor - totalPayoutMinor);
+    const totalPayoutMinor = payoutsSuccess.reduce((sum, t) => sum + t.amountMinor, 0);
+    const pendingWithdrawalsMinor = pendingWithdrawAgg._sum.amountMinor ?? 0;
+    /** Amount the mechanic can withdraw right now (excludes in-flight PAYOUT rows). */
+    const balanceMinor = Math.max(0, totalEarnedMinor - totalPayoutMinor - pendingWithdrawalsMinor);
 
     return {
       balanceMinor,
@@ -374,6 +393,7 @@ export class WalletService {
       currency: 'NGN',
       totalEarnedFromPlatformMinor: totalEarnedMinor,
       totalPayoutsMinor: totalPayoutMinor,
+      pendingWithdrawalsMinor,
     };
   }
 
@@ -466,12 +486,87 @@ export class WalletService {
     };
   }
 
+  /** Open Paystack checkouts for mechanic platform fee (resume / cancel in client). */
+  async listPendingMechanicFeeCheckouts(mechanicId: string) {
+    const rows = await this.prisma.transaction.findMany({
+      where: {
+        mechanicId,
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.PENDING,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        amountMinor: true,
+        reference: true,
+        paystackReference: true,
+        metadata: true,
+        createdAt: true,
+        bookingId: true,
+        description: true,
+      },
+    });
+    return rows.map((t) => {
+      const meta = (t.metadata as Record<string, unknown> | null) || {};
+      const authorizationUrl =
+        typeof meta.authorization_url === 'string' ? meta.authorization_url : '';
+      return {
+        id: t.id,
+        amountMinor: t.amountMinor,
+        amountNaira: t.amountMinor / 100,
+        internalReference: t.reference,
+        paystackReference: t.paystackReference,
+        authorizationUrl,
+        createdAt: t.createdAt,
+        bookingId: t.bookingId,
+        description: t.description,
+      };
+    });
+  }
+
+  /** In-flight bank withdrawals (reserved against balance until Paystack completes or fails). */
+  async listPendingWithdrawals(mechanicId: string) {
+    const rows = await this.prisma.transaction.findMany({
+      where: {
+        mechanicId,
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.PENDING,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        amountMinor: true,
+        reference: true,
+        description: true,
+        createdAt: true,
+        metadata: true,
+      },
+    });
+    return rows.map((t) => {
+      const meta = (t.metadata as Record<string, unknown> | null) || {};
+      const feeRaw = meta.feeChargedMinor;
+      const feeChargedMinor = typeof feeRaw === 'number' ? feeRaw : undefined;
+      return {
+        id: t.id,
+        amountMinor: t.amountMinor,
+        amountNaira: t.amountMinor / 100,
+        reference: t.reference,
+        description: t.description,
+        createdAt: t.createdAt,
+        feeChargedMinor,
+        feeChargedNaira: feeChargedMinor != null ? feeChargedMinor / 100 : undefined,
+      };
+    });
+  }
+
   /** Mechanic: Full wallet summary — single net balance + breakdown + recent transactions. */
   async getMechanicWalletSummary(mechanicId: string) {
-    const [balance, owing, recent] = await Promise.all([
+    const [balance, owing, recent, pendingPlatformFeeCheckouts, pendingWithdrawals] = await Promise.all([
       this.getMechanicBalance(mechanicId),
       this.getMechanicOwing(mechanicId),
       this.listMechanicTransactions(mechanicId, { limit: 20 }),
+      this.listPendingMechanicFeeCheckouts(mechanicId),
+      this.listPendingWithdrawals(mechanicId),
     ]);
     const netMinor = balance.balanceMinor - owing.owingMinor;
     return {
@@ -484,11 +579,14 @@ export class WalletService {
         unpaidPlatformFeeNaira: owing.owingNaira,
         totalEarnedFromPlatformMinor: balance.totalEarnedFromPlatformMinor,
         totalPayoutsMinor: balance.totalPayoutsMinor,
+        pendingWithdrawalsMinor: balance.pendingWithdrawalsMinor,
         totalFeeOwedMinor: owing.totalFeeOwedMinor,
         totalFeePaidMinor: owing.totalFeePaidMinor,
         currency: 'NGN',
       },
       recentTransactions: recent.items,
+      pendingPlatformFeeCheckouts,
+      pendingWithdrawals,
     };
   }
 
@@ -559,7 +657,7 @@ export class WalletService {
       if (amountMinor > availableMinor) {
         throw new BadRequestException(
           availableMinor <= 0
-            ? 'You already have a pending platform fee checkout. Complete or cancel it before starting another.'
+            ? 'You already have a pending platform fee checkout. Use Continue payment on the wallet screen, or cancel it to start a new one.'
             : `Amount exceeds available capacity (\u20A6${(availableMinor / 100).toLocaleString()}). Pending checkouts reduce what you can start.`,
         );
       }
@@ -687,6 +785,90 @@ export class WalletService {
     }
 
     return { success: true };
+  }
+
+  /**
+   * Mechanic: Abandon a pending platform-fee Paystack checkout after confirming Paystack did not succeed.
+   * If Paystack reports success, the payment is finalized instead of cancelled.
+   */
+  async cancelMechanicFeeCheckout(mechanicId: string, reference: string) {
+    const ref = reference.trim();
+    if (!ref) {
+      throw new BadRequestException('reference is required');
+    }
+
+    const pending = await this.prisma.transaction.findFirst({
+      where: {
+        mechanicId,
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.PENDING,
+        OR: [{ reference: ref }, { paystackReference: ref }],
+      },
+    });
+    if (!pending) {
+      throw new NotFoundException('No pending platform fee checkout found for that reference');
+    }
+
+    const paystackRef = (pending.paystackReference ?? pending.reference ?? ref).trim();
+    if (!paystackRef) {
+      throw new BadRequestException('Checkout has no Paystack reference; contact support');
+    }
+
+    const verify = await this.paystack.verifyTransaction(paystackRef);
+    if (verify === null) {
+      throw new ServiceUnavailableException(
+        'Unable to confirm payment status with Paystack. Try again in a moment before cancelling.',
+      );
+    }
+
+    if (verify.status === 'success') {
+      const result = await this.finalizePendingMechanicFeeWithPaystackVerify(paystackRef, pending.id);
+      if (result.applied || result.duplicate) {
+        return { success: true, outcome: 'finalized' as const };
+      }
+      if (result.reason === 'amount_mismatch') {
+        throw new BadRequestException('Paystack reports success but amount does not match. Contact support.');
+      }
+      if (result.reason === 'db_error') {
+        throw new BadRequestException('Payment succeeded but confirmation failed. Try Verify again or contact support.');
+      }
+      const done = await this.prisma.transaction.findFirst({
+        where: {
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.SUCCESS,
+          paystackReference: paystackRef,
+          mechanicId,
+        },
+      });
+      if (done) {
+        return { success: true, outcome: 'finalized' as const };
+      }
+      throw new BadRequestException('Could not finalize this payment. Try verifying from the wallet screen.');
+    }
+
+    const meta = (pending.metadata as Record<string, unknown> | null) || {};
+    const updated = await this.prisma.transaction.updateMany({
+      where: { id: pending.id, status: TransactionStatus.PENDING },
+      data: {
+        status: TransactionStatus.FAILED,
+        metadata: {
+          ...meta,
+          cancelledAt: new Date().toISOString(),
+          cancelReason: 'mechanic_cancelled_checkout',
+        },
+      },
+    });
+    if (updated.count === 0) {
+      const stillThere = await this.prisma.transaction.findFirst({
+        where: { id: pending.id, mechanicId, type: TransactionType.MECHANIC_FEE },
+      });
+      if (stillThere?.status === TransactionStatus.SUCCESS) {
+        return { success: true, outcome: 'finalized' as const };
+      }
+      throw new ConflictException('This checkout was already updated. Refresh the wallet and try again.');
+    }
+
+    return { success: true, outcome: 'cancelled' as const };
   }
 
   /**
@@ -844,8 +1026,18 @@ export class WalletService {
     }
 
     const lines: { label: string; value: string }[] = [];
+    const meta = (t.metadata as Record<string, unknown> | null) || {};
     if (t.type === TransactionType.PLATFORM_PAYOUT) {
       lines.push({ label: 'Type', value: 'Withdrawal / payout to your bank' });
+      if (typeof meta.transferCode === 'string' && meta.transferCode.trim()) {
+        lines.push({ label: 'Paystack transfer', value: meta.transferCode.trim() });
+      }
+      if (typeof meta.feeChargedMinor === 'number' && meta.feeChargedMinor > 0) {
+        lines.push({
+          label: 'Paystack transfer fee',
+          value: `\u20A6${(meta.feeChargedMinor / 100).toLocaleString()} (charged to platform)`,
+        });
+      }
     } else if (t.type === TransactionType.MECHANIC_FEE) {
       lines.push({
         label: 'Type',
@@ -993,35 +1185,270 @@ export class WalletService {
     return account;
   }
 
+  /** Create or reuse Paystack transfer recipient for this saved bank account. */
+  private async resolvePaystackRecipientCode(account: {
+    id: string;
+    bankCode: string;
+    bankName: string;
+    accountNumber: string;
+    accountName: string;
+    paystackRecipientCode: string | null;
+  }): Promise<string> {
+    if (account.paystackRecipientCode?.trim()) {
+      return account.paystackRecipientCode.trim();
+    }
+    const { recipientCode } = await this.paystack.createTransferRecipient(
+      account.bankCode,
+      account.accountNumber,
+      account.accountName,
+    );
+    await this.prisma.mechanicBankAccount.update({
+      where: { id: account.id },
+      data: { paystackRecipientCode: recipientCode },
+    });
+    return recipientCode;
+  }
+
   /** Generate a unique transfer reference (16–50 chars, lowercase alphanumeric, underscore, dash). */
   private transferReference(prefix: string): string {
     return `${prefix}_${randomBytes(8).toString('hex')}`;
   }
 
   /**
-   * Mechanic: Request withdrawal. Sends money via Paystack Transfer to mechanic's default bank account, then records payout.
+   * Paystack `transfer.success` webhook: mark matching PENDING payout as SUCCESS (idempotent).
+   */
+  async finalizeTransferPayoutFromWebhook(params: {
+    reference: string;
+    transferCode?: string;
+    amount?: number;
+    feeCharged?: number;
+  }): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
+    const reference = params.reference.trim();
+    if (!reference) return { applied: false, reason: 'no_reference' };
+
+    const already = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.SUCCESS,
+        reference,
+      },
+    });
+    if (already) {
+      return { applied: false, duplicate: true };
+    }
+
+    const pending = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.PENDING,
+        reference,
+      },
+    });
+    if (!pending) {
+      this.logger.warn(`transfer webhook: no PENDING payout for reference=${reference}`);
+      return { applied: false, reason: 'no_pending' };
+    }
+
+    if (params.amount != null && params.amount !== pending.amountMinor) {
+      this.logger.error(
+        `transfer webhook: amount mismatch ref=${reference} expected=${pending.amountMinor} got=${params.amount}`,
+      );
+      return { applied: false, reason: 'amount_mismatch' };
+    }
+
+    let feeCharged = params.feeCharged ?? 0;
+    let transferCode = params.transferCode?.trim() ?? '';
+    const meta = (pending.metadata as Record<string, unknown> | null) || {};
+    if (!transferCode && typeof meta.transferCode === 'string') {
+      transferCode = meta.transferCode;
+    }
+    if (feeCharged === 0 && transferCode) {
+      const fetched = await this.paystack.fetchTransfer(transferCode);
+      if (fetched) feeCharged = fetched.feeCharged;
+    }
+
+    const mergedMeta = {
+      ...(JSON.parse(JSON.stringify(meta || {})) as Record<string, string | number | boolean | null>),
+      transferCode: transferCode || (typeof meta.transferCode === 'string' ? meta.transferCode : ''),
+      feeChargedMinor: feeCharged,
+      paystackTransferStatus: 'success',
+      finalizedVia: 'paystack_webhook',
+      webhookAt: new Date().toISOString(),
+      source: typeof meta.source === 'string' ? meta.source : 'mechanic_withdrawal',
+    };
+
+    const updated = await this.prisma.transaction.updateMany({
+      where: { id: pending.id, status: TransactionStatus.PENDING },
+      data: {
+        status: TransactionStatus.SUCCESS,
+        metadata: mergedMeta as Prisma.InputJsonValue,
+      },
+    });
+    if (updated.count === 0) {
+      return { applied: false, duplicate: true };
+    }
+    this.logger.log(`PLATFORM_PAYOUT finalized via webhook ref=${reference}`);
+    return { applied: true };
+  }
+
+  /**
+   * Paystack `transfer.failed` / `transfer.reversed`: release reserved payout row.
+   */
+  async failTransferPayoutFromWebhook(
+    reference: string,
+    extra: { reason: string; event?: string },
+  ): Promise<{ applied: boolean }> {
+    const ref = reference.trim();
+    if (!ref) return { applied: false };
+
+    const row = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.PENDING,
+        reference: ref,
+      },
+    });
+    if (!row) {
+      return { applied: false };
+    }
+
+    const oldMeta = (row.metadata as Record<string, unknown> | null) || {};
+    const metaPatch = {
+      ...oldMeta,
+      webhookFailedAt: new Date().toISOString(),
+      webhookFailureReason: extra.reason.slice(0, 500),
+      webhookEvent: extra.event ?? 'unknown',
+    };
+
+    const res = await this.prisma.transaction.updateMany({
+      where: { id: row.id, status: TransactionStatus.PENDING },
+      data: {
+        status: TransactionStatus.FAILED,
+        metadata: metaPatch as Prisma.InputJsonValue,
+      },
+    });
+
+    if (res.count === 0) {
+      return { applied: false };
+    }
+    this.logger.warn(`PLATFORM_PAYOUT marked FAILED from webhook ref=${ref} reason=${extra.reason}`);
+    return { applied: true };
+  }
+
+  /** Route Paystack transfer lifecycle webhooks (configure in Paystack Dashboard). */
+  async applyPaystackTransferWebhook(event: string, data: Record<string, unknown>): Promise<void> {
+    const reference = typeof data.reference === 'string' ? data.reference.trim() : '';
+    if (!reference) {
+      this.logger.warn(`Paystack transfer webhook ${event}: missing reference`);
+      return;
+    }
+
+    if (event === 'transfer.success') {
+      const amount = typeof data.amount === 'number' ? data.amount : undefined;
+      const fee =
+        typeof data.fee_charged === 'number'
+          ? data.fee_charged
+          : typeof data.feeCharged === 'number'
+            ? data.feeCharged
+            : undefined;
+      const transferCode = typeof data.transfer_code === 'string' ? data.transfer_code : undefined;
+      const out = await this.finalizeTransferPayoutFromWebhook({
+        reference,
+        transferCode,
+        amount,
+        feeCharged: fee,
+      });
+      this.logger.log(`transfer.success ref=${reference} result=${JSON.stringify(out)}`);
+      return;
+    }
+
+    if (event === 'transfer.failed' || event === 'transfer.reversed') {
+      const failures = data.failures != null ? JSON.stringify(data.failures) : '';
+      const gateway =
+        typeof data.gateway_response === 'string' ? data.gateway_response : '';
+      const reason =
+        typeof data.reason === 'string'
+          ? data.reason
+          : [failures, gateway, event].filter(Boolean).join(' · ') || event;
+      await this.failTransferPayoutFromWebhook(reference, { reason, event });
+    }
+  }
+
+  /**
+   * Mechanic: Request withdrawal. Reserves balance (PENDING) under Serializable isolation, sends Paystack transfer.
+   * Live transfers often return `pending`; final SUCCESS is applied via `transfer.success` webhook (or immediately in test).
    */
   async requestWithdrawal(mechanicId: string, amountMinor: number) {
-    const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
-    if (!mechanic) throw new NotFoundException('Mechanic not found');
-    const balance = await this.getMechanicBalance(mechanicId);
-    if (amountMinor <= 0) throw new BadRequestException('Amount must be positive');
-    if (amountMinor > balance.balanceMinor) {
-      throw new BadRequestException(`Amount exceeds balance (₦${(balance.balanceMinor / 100).toLocaleString()})`);
-    }
     const bankAccount = await this.getDefaultBankAccount(mechanicId);
     if (!bankAccount) {
       throw new BadRequestException('Add a default bank account in Wallet before withdrawing');
     }
 
     const reference = this.transferReference('wd');
-    let transferCode: string | undefined;
+    const description = `Withdrawal to ${bankAccount.bankName} · ${bankAccount.accountNumber}`;
+
+    let pendingRow: { id: string; metadata: unknown };
     try {
-      const { recipientCode } = await this.paystack.createTransferRecipient(
-        bankAccount.bankCode,
-        bankAccount.accountNumber,
-        bankAccount.accountName,
+      pendingRow = await this.prisma.$transaction(
+        async (tx) => {
+          const mechanic = await tx.mechanic.findUnique({ where: { id: mechanicId } });
+          if (!mechanic) throw new NotFoundException('Mechanic not found');
+
+          const balance = await this.getMechanicBalance(mechanicId, tx);
+          if (amountMinor <= 0) throw new BadRequestException('Amount must be positive');
+          if (amountMinor > balance.balanceMinor) {
+            throw new BadRequestException(
+              `Amount exceeds balance (₦${(balance.balanceMinor / 100).toLocaleString()})`,
+            );
+          }
+
+          return tx.transaction.create({
+            data: {
+              type: TransactionType.PLATFORM_PAYOUT,
+              amountMinor,
+              currency: 'NGN',
+              status: TransactionStatus.PENDING,
+              reference,
+              mechanicId,
+              description,
+              metadata: { source: 'mechanic_withdrawal', phase: 'reserved' },
+            },
+            select: { id: true, metadata: true },
+          });
+        },
+        {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+          maxWait: 5000,
+          timeout: 15000,
+        },
       );
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && (e.code === 'P2034' || e.code === 'P2028')) {
+        throw new ConflictException(
+          'Another withdrawal updated your balance at the same time. Please try again in a few seconds.',
+        );
+      }
+      throw e;
+    }
+
+    const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
+    if (!mechanic) throw new NotFoundException('Mechanic not found');
+
+    const markFailed = async (extraMeta: Record<string, unknown>) => {
+      const meta = (pendingRow.metadata as Record<string, unknown> | null) || {};
+      await this.prisma.transaction.updateMany({
+        where: { id: pendingRow.id, status: TransactionStatus.PENDING },
+        data: {
+          status: TransactionStatus.FAILED,
+          metadata: { ...meta, ...extraMeta, failedAt: new Date().toISOString() },
+        },
+      });
+    };
+
+    let transferCode: string;
+    let paystackTransferStatus: string;
+    try {
+      const recipientCode = await this.resolvePaystackRecipientCode(bankAccount);
       const result = await this.paystack.initiateTransfer(
         amountMinor,
         recipientCode,
@@ -1029,25 +1456,88 @@ export class WalletService {
         `Withdrawal to ${mechanic.companyName}`,
       );
       transferCode = result.transferCode;
+      paystackTransferStatus = result.status;
     } catch (err: any) {
       const msg = err?.message ?? 'Transfer failed';
-      throw new BadRequestException(msg);
+      await markFailed({ errorMessage: String(msg) });
+      throw new BadRequestException(typeof msg === 'string' ? msg : 'Transfer failed');
     }
 
-    const tx = await this.prisma.transaction.create({
-      data: {
-        type: TransactionType.PLATFORM_PAYOUT,
+    const last4 =
+      bankAccount.accountNumber.length >= 4
+        ? bankAccount.accountNumber.slice(-4)
+        : bankAccount.accountNumber;
+
+    const baseMeta = {
+      ...((pendingRow.metadata as Record<string, unknown> | null) || {}),
+      transferCode,
+      paystackTransferStatus,
+      source: 'mechanic_withdrawal',
+    };
+
+    try {
+      if (paystackTransferStatus === 'success') {
+        let feeCharged = 0;
+        const fetched = await this.paystack.fetchTransfer(transferCode);
+        if (fetched) feeCharged = fetched.feeCharged;
+
+        const updated = await this.prisma.transaction.update({
+          where: { id: pendingRow.id, status: TransactionStatus.PENDING },
+          data: {
+            status: TransactionStatus.SUCCESS,
+            metadata: {
+              ...baseMeta,
+              feeChargedMinor: feeCharged,
+              finalizedVia: 'paystack_immediate',
+            },
+          },
+        });
+        return {
+          success: true,
+          transferStatus: 'completed' as const,
+          id: updated.id,
+          amountMinor,
+          amountNaira: amountMinor / 100,
+          destinationBank: bankAccount.bankName,
+          destinationAccountLast4: last4,
+          reference: updated.reference,
+          paystackTransferStatus,
+          feeChargedMinor: feeCharged,
+          feeChargedNaira: feeCharged / 100,
+        };
+      }
+
+      await this.prisma.transaction.update({
+        where: { id: pendingRow.id },
+        data: {
+          metadata: {
+            ...baseMeta,
+            phase: 'paystack_queued',
+          },
+        },
+      });
+
+      return {
+        success: true,
+        transferStatus: 'processing' as const,
+        id: pendingRow.id,
         amountMinor,
-        currency: 'NGN',
-        status: TransactionStatus.SUCCESS,
+        amountNaira: amountMinor / 100,
+        destinationBank: bankAccount.bankName,
+        destinationAccountLast4: last4,
         reference,
-        mechanicId,
-        description: `Withdrawal to ${bankAccount.bankName} · ${bankAccount.accountNumber}`,
-        metadata: { transferCode, source: 'mechanic_withdrawal' },
-      },
-      include: { mechanic: { select: { id: true, companyName: true } } },
-    });
-    return tx;
+        paystackTransferStatus,
+        feeChargedMinor: null as number | null,
+        feeChargedNaira: null as number | null,
+      };
+    } catch (e) {
+      this.logger.error(
+        `Withdrawal Paystack accepted but DB update failed pendingId=${pendingRow.id} ref=${reference} ${String(e)}`,
+      );
+      throw new BadRequestException(
+        `Transfer may have been queued. Save this reference: ${reference}. If your balance does not update, wait a few minutes or contact support.`,
+      );
+    }
   }
 
   /**
@@ -1070,11 +1560,7 @@ export class WalletService {
     const finalRef = ref.length >= 16 ? ref : `${ref}_${randomBytes(4).toString('hex')}`;
     let transferCode: string | undefined;
     try {
-      const { recipientCode } = await this.paystack.createTransferRecipient(
-        bankAccount.bankCode,
-        bankAccount.accountNumber,
-        bankAccount.accountName,
-      );
+      const recipientCode = await this.resolvePaystackRecipientCode(bankAccount);
       const result = await this.paystack.initiateTransfer(
         amountMinor,
         recipientCode,

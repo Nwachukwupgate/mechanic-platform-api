@@ -32,7 +32,7 @@ export class PaystackWebhookController {
       return { received: true };
     }
 
-    let payload: { event?: string; data?: { reference?: string } };
+    let payload: { event?: string; data?: Record<string, unknown> };
     try {
       payload = JSON.parse(raw.toString('utf8')) as typeof payload;
     } catch {
@@ -40,8 +40,15 @@ export class PaystackWebhookController {
       return { received: true };
     }
 
-    if (payload.event === 'charge.success' && payload.data?.reference) {
-      const ref = String(payload.data.reference).trim();
+    const event = payload.event;
+
+    if (
+      event === 'charge.success' &&
+      payload.data &&
+      typeof payload.data.reference === 'string' &&
+      payload.data.reference.trim()
+    ) {
+      const ref = payload.data.reference.trim();
       try {
         const userOut = await this.walletService.finalizePaystackUserPaymentFromWebhook(ref);
         this.logger.log(`charge.success user ref=${ref} result=${JSON.stringify(userOut)}`);
@@ -49,6 +56,18 @@ export class PaystackWebhookController {
         this.logger.log(`charge.success mechanic ref=${ref} result=${JSON.stringify(mechOut)}`);
       } catch (e) {
         this.logger.error(`charge.success handler error reference=${ref} ${String(e)}`);
+      }
+    }
+
+    if (
+      event === 'transfer.success' ||
+      event === 'transfer.failed' ||
+      event === 'transfer.reversed'
+    ) {
+      try {
+        await this.walletService.applyPaystackTransferWebhook(event, (payload.data ?? {}) as Record<string, unknown>);
+      } catch (e) {
+        this.logger.error(`transfer webhook handler error event=${event} ${String(e)}`);
       }
     }
 
