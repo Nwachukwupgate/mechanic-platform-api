@@ -77,7 +77,7 @@ export class BookingsService {
   async findNearbyMechanics(
     lat: number,
     lng: number,
-    faultCategory: string,
+    faultCategory: string | undefined,
     radiusKm: number = 10,
     vehicleId?: string,
     opts?: {
@@ -86,7 +86,10 @@ export class BookingsService {
       availableOnly?: boolean;
     },
   ) {
-    const expertiseCategory = this.mapFaultCategoryToExpertise(faultCategory);
+    const expertiseCategory =
+      faultCategory != null && faultCategory.trim() !== ''
+        ? this.mapFaultCategoryToExpertise(faultCategory)
+        : undefined;
 
     let blockedMechanicIds: string[] = [];
     if (opts?.userId) {
@@ -120,7 +123,9 @@ export class BookingsService {
             : {}),
         },
         ...(opts?.availableOnly === false ? {} : { availability: true }),
-        expertise: { has: expertiseCategory },
+        ...(expertiseCategory
+          ? { expertise: { has: expertiseCategory } }
+          : {}),
         latitude: { not: null },
         longitude: { not: null },
       },

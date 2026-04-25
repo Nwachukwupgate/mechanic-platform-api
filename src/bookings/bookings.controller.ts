@@ -47,16 +47,21 @@ export class BookingsController {
     @CurrentUser() user: any,
     @Query('lat') lat: string,
     @Query('lng') lng: string,
-    @Query('faultCategory') faultCategory: string,
+    /** Omit or leave empty to return any verified mechanics in radius (e.g. home strip). */
+    @Query('faultCategory') faultCategory?: string,
     @Query('radius') radius?: string,
     @Query('vehicleId') vehicleId?: string,
     @Query('minRating') minRating?: string,
     @Query('availableOnly') availableOnly?: string,
   ) {
+    const category =
+      faultCategory != null && faultCategory.trim() !== ''
+        ? faultCategory.trim()
+        : undefined;
     return this.bookingsService.findNearbyMechanics(
       parseFloat(lat),
       parseFloat(lng),
-      faultCategory,
+      category,
       radius ? parseFloat(radius) : 10,
       vehicleId,
       {
