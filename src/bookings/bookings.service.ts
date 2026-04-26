@@ -130,7 +130,20 @@ export class BookingsService {
         longitude: { not: null },
       },
       include: {
-        mechanic: { include: { receivedRatings: { select: { rating: true } } } },
+        mechanic: {
+          include: {
+            receivedRatings: { select: { rating: true } },
+            _count: {
+              select: {
+                bookings: {
+                  where: {
+                    status: { in: ['DONE', 'PAID', 'DELIVERED'] },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     });
 
@@ -182,12 +195,15 @@ export class BookingsService {
         m.latitude!,
         m.longitude!,
       );
-      const { receivedRatings, ...mechanicWithoutR } = m.mechanic as any;
+      const mech = m.mechanic as any;
+      const { receivedRatings, _count, ...mechanicWithoutR } = mech;
+      const jobsCompleted = typeof _count?.bookings === 'number' ? _count.bookings : 0;
       return {
         ...m,
         mechanic: mechanicWithoutR,
         distanceKm,
         averageRating: avg,
+        jobsCompleted,
       };
     });
 
@@ -258,6 +274,7 @@ export class BookingsService {
           orderBy: { createdAt: 'desc' },
           take: 30,
         },
+        ratings: { take: 1, select: { id: true, rating: true } },
       },
     });
 

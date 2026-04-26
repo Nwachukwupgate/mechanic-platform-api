@@ -50,6 +50,11 @@ enum TransactionStatus {
   FAILED
 }
 
+enum NotificationRecipientRole {
+  USER
+  MECHANIC
+}
+
 enum VehicleType {
   SEDAN
   SUV
@@ -72,6 +77,21 @@ model AccountDeletionLog {
   reasons    Json // string[]
   otherText  String?
   createdAt  DateTime @default(now())
+}
+
+model InAppNotification {
+  id              String                    @id @default(uuid())
+  recipientRole   NotificationRecipientRole
+  recipientId     String
+  type            String
+  title           String
+  body            String
+  data            Json?
+  readAt          DateTime?
+  createdAt       DateTime                  @default(now())
+
+  @@index([recipientRole, recipientId, readAt])
+  @@index([recipientRole, recipientId, createdAt(sort: Desc)])
 }
 
 model User {

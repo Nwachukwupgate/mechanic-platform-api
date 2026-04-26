@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, NotificationRecipientRole } from '@prisma/client';
 import { NotificationsService } from './notifications.service';
 import { PrismaService } from '../common/prisma/prisma.service';
 
@@ -35,6 +35,14 @@ export class NotificationsListener {
         data: { bookingId: payload.bookingId, type: 'quote_created' },
       });
     }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.USER,
+      recipientId: payload.userId,
+      type: 'QUOTE_CREATED',
+      title: 'New quote',
+      body: `${mech} quoted on your job.`,
+      data: { bookingId: payload.bookingId },
+    });
   }
 
   @OnEvent('quote.accepted')
@@ -63,6 +71,14 @@ export class NotificationsListener {
         data: { bookingId: payload.bookingId, type: 'quote_accepted' },
       });
     }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.MECHANIC,
+      recipientId: payload.mechanicId,
+      type: 'QUOTE_ACCEPTED',
+      title: 'Quote accepted',
+      body: 'The customer accepted your quote.',
+      data: { bookingId: payload.bookingId },
+    });
     if (user?.email) {
       await this.notifications.sendEmail(
         user.email,
@@ -70,6 +86,14 @@ export class NotificationsListener {
         `You accepted a quote. Booking ${payload.bookingId.slice(0, 8)}… Chat is now open.`,
       );
     }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.USER,
+      recipientId: payload.userId,
+      type: 'QUOTE_ACCEPTED',
+      title: 'Booking confirmed',
+      body: 'Your quote was accepted. Chat is now open.',
+      data: { bookingId: payload.bookingId },
+    });
   }
 
   @OnEvent('booking.statusChanged')
@@ -89,7 +113,10 @@ export class NotificationsListener {
           select: { email: true, expoPushToken: true },
         })
       : null;
-    const label = payload.status.replace('_', ' ');
+    const label = String(payload.status)
+      .replace(/_/g, ' ')
+      .toLowerCase()
+      .replace(/\b\w/g, (c) => c.toUpperCase());
     if (user?.email) {
       await this.notifications.sendEmail(
         user.email,
@@ -116,6 +143,24 @@ export class NotificationsListener {
         title: 'Booking update',
         body: `Status: ${label}`,
         data: { bookingId: payload.bookingId, type: 'status', status: payload.status },
+      });
+    }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.USER,
+      recipientId: payload.userId,
+      type: 'BOOKING_STATUS',
+      title: 'Booking update',
+      body: `Status is now ${label}.`,
+      data: { bookingId: payload.bookingId, status: payload.status },
+    });
+    if (payload.mechanicId) {
+      await this.notifications.createInApp({
+        recipientRole: NotificationRecipientRole.MECHANIC,
+        recipientId: payload.mechanicId,
+        type: 'BOOKING_STATUS',
+        title: 'Booking update',
+        body: `Status is now ${label}.`,
+        data: { bookingId: payload.bookingId, status: payload.status },
       });
     }
   }
