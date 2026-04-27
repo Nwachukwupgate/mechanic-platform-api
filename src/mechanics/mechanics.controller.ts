@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Body, UseGuards, Param, Post, Delete } from '@nestjs/common';
+import { Controller, Get, Put, Body, UseGuards, Param, Post, Delete, Query } from '@nestjs/common';
 import { UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
@@ -23,6 +23,21 @@ export class MechanicsController {
   @Get()
   async findAll() {
     return this.mechanicsService.findAll();
+  }
+
+  /** Logged-in customers only: anonymised completed jobs for trust on mechanic profile. */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
+  @Get(':id/public-job-history')
+  async getPublicJobHistory(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+  ) {
+    const n = limit != null && limit.trim() !== '' ? parseInt(limit, 10) : undefined;
+    return this.mechanicsService.findPublicJobHistoryForMechanic(
+      id,
+      Number.isFinite(n) ? n : undefined,
+    );
   }
 
   @Get(':id')

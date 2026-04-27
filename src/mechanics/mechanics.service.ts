@@ -131,6 +131,62 @@ export class MechanicsService {
   }
 
   /**
+   * Completed platform jobs for a garage, safe to show to logged-in customers (no user PII, no phones, no plate).
+   */
+  async findPublicJobHistoryForMechanic(mechanicId: string, limit?: number) {
+    const mechanic = await this.prisma.mechanic.findFirst({
+      where: { id: mechanicId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!mechanic) throw new NotFoundException('Mechanic not found');
+
+    const raw = limit != null && Number.isFinite(limit) ? Math.floor(Number(limit)) : 30;
+    const cap = Math.min(Math.max(raw, 1), 50);
+
+    const [jobs, completedCount] = await Promise.all([
+      this.prisma.booking.findMany({
+        where: {
+          mechanicId,
+          status: { in: ['DONE', 'PAID', 'DELIVERED'] },
+        },
+        orderBy: [{ completedAt: 'desc' }, { paidAt: 'desc' }, { updatedAt: 'desc' }],
+        take: cap,
+        select: {
+          id: true,
+          status: true,
+          createdAt: true,
+          completedAt: true,
+          paidAt: true,
+          deliveredAt: true,
+          fault: { select: { name: true, category: true } },
+          vehicle: { select: { type: true, brand: true, model: true, year: true } },
+        },
+      }),
+      this.prisma.booking.count({
+        where: {
+          mechanicId,
+          status: { in: ['DONE', 'PAID', 'DELIVERED'] },
+        },
+      }),
+    ]);
+
+    return {
+      mechanicId,
+      completedJobCount: completedCount,
+      jobs: jobs.map((r) => ({
+        id: r.id,
+        status: r.status,
+        createdAt: r.createdAt,
+        completedAt: r.completedAt ?? r.paidAt ?? r.deliveredAt ?? null,
+        faultName: r.fault.name,
+        faultCategory: r.fault.category,
+        vehicleType: r.vehicle.type,
+        vehicleLabel: `${r.vehicle.year} ${r.vehicle.brand} ${r.vehicle.model}`.trim(),
+      })),
+    };
+  }
+
+  /**
    * Mechanic self-service profile payload with engagement stats for dashboard / profile UI.
    */
   async getMyProfileWithStats(mechanicId: string) {
