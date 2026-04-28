@@ -1,4 +1,12 @@
-import { Controller, Post, Req, Headers, Logger, RawBodyRequest } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Req,
+  Headers,
+  Logger,
+  RawBodyRequest,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import type { Request } from 'express';
 import { WalletService } from './wallet.service';
 import { PaystackService } from './paystack.service';
@@ -41,6 +49,7 @@ export class PaystackWebhookController {
     }
 
     const event = payload.event;
+    let processingFailed = false;
 
     if (
       event === 'charge.success' &&
@@ -56,6 +65,7 @@ export class PaystackWebhookController {
         this.logger.log(`charge.success mechanic ref=${ref} result=${JSON.stringify(mechOut)}`);
       } catch (e) {
         this.logger.error(`charge.success handler error reference=${ref} ${String(e)}`);
+        processingFailed = true;
       }
     }
 
@@ -68,7 +78,13 @@ export class PaystackWebhookController {
         await this.walletService.applyPaystackTransferWebhook(event, (payload.data ?? {}) as Record<string, unknown>);
       } catch (e) {
         this.logger.error(`transfer webhook handler error event=${event} ${String(e)}`);
+        processingFailed = true;
       }
+    }
+
+    if (processingFailed) {
+      // Return non-2xx so Paystack retries this webhook event.
+      throw new ServiceUnavailableException('Webhook accepted but processing failed');
     }
 
     return { received: true };

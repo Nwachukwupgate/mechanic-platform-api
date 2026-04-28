@@ -21,7 +21,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "prisma:seed": "npx prisma db seed"
+    "prisma:seed": "npx prisma db seed",
+    "wallet:repair:user-payment-finalization": "ts-node prisma/repair-user-payment-finalization.ts"
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"

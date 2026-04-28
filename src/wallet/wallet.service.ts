@@ -180,6 +180,85 @@ export class WalletService {
   }
 
   /**
+   * Safety net for historical/race edge-cases:
+   * if USER_PAYMENT is SUCCESS but booking is not fully marked as platform-paid,
+   * reconcile booking state so mechanic balance reflects the payment.
+   */
+  private async reconcileBookingFromSuccessfulUserPayment(
+    txClient: Prisma.TransactionClient | PrismaService,
+    paymentTx: {
+      id: string;
+      bookingId: string | null;
+      amountMinor: number;
+      paystackReference: string | null;
+    },
+  ): Promise<boolean> {
+    if (!paymentTx.bookingId) {
+      this.logger.warn(`reconcile USER_PAYMENT skipped: tx=${paymentTx.id} has no bookingId`);
+      return false;
+    }
+
+    const booking = await txClient.booking.findUnique({
+      where: { id: paymentTx.bookingId },
+      select: {
+        id: true,
+        userId: true,
+        mechanicId: true,
+        paidAt: true,
+        paymentMethod: true,
+        paidAmount: true,
+        paystackReference: true,
+        status: true,
+      },
+    });
+    if (!booking) {
+      this.logger.error(`reconcile USER_PAYMENT failed: booking not found bookingId=${paymentTx.bookingId}`);
+      return false;
+    }
+
+    if (booking.paymentMethod && booking.paymentMethod !== PaymentMethod.PLATFORM) {
+      this.logger.error(
+        `reconcile USER_PAYMENT skipped: booking=${booking.id} has paymentMethod=${booking.paymentMethod}`,
+      );
+      return false;
+    }
+
+    const alreadyConsistent =
+      booking.paidAt != null &&
+      booking.paymentMethod === PaymentMethod.PLATFORM &&
+      booking.paidAmount != null &&
+      booking.status === BookingStatus.PAID;
+    if (alreadyConsistent) {
+      return false;
+    }
+
+    const paidAmountNaira =
+      booking.paidAmount != null && booking.paidAmount > 0
+        ? booking.paidAmount
+        : paymentTx.amountMinor / 100;
+
+    await txClient.booking.update({
+      where: { id: booking.id },
+      data: {
+        paidAt: booking.paidAt ?? new Date(),
+        paymentMethod: PaymentMethod.PLATFORM,
+        paidAmount: paidAmountNaira,
+        paystackReference: booking.paystackReference ?? paymentTx.paystackReference ?? undefined,
+        status: BookingStatus.PAID,
+      },
+    });
+
+    this.eventEmitter.emit('booking.statusChanged', {
+      bookingId: booking.id,
+      status: BookingStatus.PAID,
+      userId: booking.userId,
+      mechanicId: booking.mechanicId,
+    });
+    this.logger.warn(`reconcile USER_PAYMENT applied bookingId=${booking.id} tx=${paymentTx.id}`);
+    return true;
+  }
+
+  /**
    * Confirm pending USER_PAYMENT: verify with Paystack API, then atomically flip tx + booking to paid.
    */
   private async finalizePendingUserPaymentWithPaystackVerify(
@@ -194,6 +273,12 @@ export class WalletService {
       },
     });
     if (successRow) {
+      await this.reconcileBookingFromSuccessfulUserPayment(this.prisma, {
+        id: successRow.id,
+        bookingId: successRow.bookingId,
+        amountMinor: successRow.amountMinor,
+        paystackReference: successRow.paystackReference,
+      });
       return { applied: false, duplicate: true };
     }
 
