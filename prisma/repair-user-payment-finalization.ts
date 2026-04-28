@@ -1,10 +1,23 @@
 /* eslint-disable no-console */
+import 'dotenv/config';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { BookingStatus, PaymentMethod, PrismaClient, TransactionStatus, TransactionType } from '@prisma/client';
 
 type Args = {
   apply: boolean;
   references: string[];
 };
+
+function connectionString(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error('DATABASE_URL is required');
+  const limit = 'connection_limit=10';
+  if (url.includes('connection_limit=')) {
+    return url.replace(/connection_limit=\d+/, limit);
+  }
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}${limit}`;
+}
 
 function parseArgs(argv: string[]): Args {
   const args: Args = { apply: false, references: [] };
@@ -105,7 +118,8 @@ async function reconcileBookingForTx(
 
 async function main() {
   const { apply, references } = parseArgs(process.argv.slice(2));
-  const prisma = new PrismaClient();
+  const adapter = new PrismaPg({ connectionString: connectionString() });
+  const prisma = new PrismaClient({ adapter });
 
   try {
     console.log(`Mode: ${apply ? 'APPLY' : 'DRY_RUN'}`);
