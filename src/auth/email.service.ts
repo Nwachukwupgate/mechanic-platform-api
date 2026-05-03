@@ -46,4 +46,28 @@ export class EmailService {
       throw error;
     }
   }
+
+  async sendPasswordResetOtp(email: string, code: string, role: string) {
+    const roleLabel = role === 'MECHANIC' ? 'mechanic' : 'user';
+    const mailOptions = {
+      from: this.configService.get<string>('EMAIL_FROM'),
+      to: email,
+      subject: 'Your password reset code — Denicksen Auto',
+      html: `
+        <h2>Password reset</h2>
+        <p>You requested to reset your password (${roleLabel} account). Use this code in the app:</p>
+        <p style="font-size: 28px; font-weight: bold; letter-spacing: 6px; font-family: monospace;">${code}</p>
+        <p>This code expires in <strong>15 minutes</strong>. If you did not request this, you can ignore this email.</p>
+        <p>— Denicksen Auto</p>
+      `,
+    };
+
+    try {
+      await this.transporter.sendMail(mailOptions);
+      console.log('Password reset OTP sent to:', email);
+    } catch (error) {
+      console.error('Error sending password reset email:', error);
+      throw error;
+    }
+  }
 }

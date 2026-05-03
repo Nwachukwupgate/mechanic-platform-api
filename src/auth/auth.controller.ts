@@ -4,6 +4,8 @@ import { LocalAuthGuard } from './guards/local-auth.guard';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserRole } from '@prisma/client';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordOtpDto } from './dto/reset-password-otp.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -54,6 +56,23 @@ export class AuthController {
   @Get('verify-email')
   async verifyEmail(@Query('token') token: string, @Query('role') role: string) {
     return this.authService.verifyEmail(token, role as UserRole);
+  }
+
+  @Post('forgot-password')
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    const role = dto.role === 'MECHANIC' ? UserRole.MECHANIC : UserRole.USER;
+    return this.authService.requestPasswordResetOtp(dto.email, role);
+  }
+
+  @Post('reset-password')
+  async resetPassword(@Body() dto: ResetPasswordOtpDto) {
+    const role = dto.role === 'MECHANIC' ? UserRole.MECHANIC : UserRole.USER;
+    return this.authService.resetPasswordWithOtp({
+      email: dto.email,
+      role,
+      code: dto.code,
+      newPassword: dto.newPassword,
+    });
   }
 
   @UseGuards(JwtAuthGuard)

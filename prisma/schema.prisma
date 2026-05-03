@@ -79,6 +79,19 @@ model AccountDeletionLog {
   createdAt  DateTime @default(now())
 }
 
+/** Email OTP for password reset (mobile-first flow). */
+model PasswordResetOtp {
+  id        String   @id @default(uuid())
+  email     String
+  role      UserRole
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([email, role])
+}
+
 model InAppNotification {
   id              String                    @id @default(uuid())
   recipientRole   NotificationRecipientRole
