@@ -19,8 +19,15 @@ import {
 } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-
-const PLATFORM_FEE_PERCENT = 20; // we take 20%, mechanic gets 80%
+import {
+  PLATFORM_FEE_PERCENT,
+  MECHANIC_SHARE_PERCENT,
+  grossNairaToKobo,
+  platformKeepsMinorFromGrossKobo,
+  mechanicShareMinorFromGrossKobo,
+  directJobPlatformFeeMinorFromGrossNaira,
+  platformJobMechanicShareMinorFromGrossNaira,
+} from './mechanic-wallet-amounts';
 
 @Injectable()
 export class WalletService {
@@ -464,7 +471,7 @@ export class WalletService {
     ]);
 
     const totalEarnedMinor = platformPaid.reduce(
-      (sum, b) => sum + Math.round((b.paidAmount ?? 0) * 100 * (1 - PLATFORM_FEE_PERCENT / 100)),
+      (sum, b) => sum + platformJobMechanicShareMinorFromGrossNaira(b.paidAmount),
       0,
     );
     const totalPayoutMinor = payoutsSuccess.reduce((sum, t) => sum + t.amountMinor, 0);
@@ -482,7 +489,12 @@ export class WalletService {
     };
   }
 
-  /** Mechanic: Amount they owe us (20% of direct-paid bookings minus fees already paid). */
+  /**
+   * Mechanic: Platform fee on direct-paid jobs (20% of recorded customer payments).
+   * - `grossUnpaidAfterSuccessPaymentsMinor`: still owed after confirmed fee payments only.
+   * - `pendingFeeCheckoutsMinor`: Paystack checkouts started but not yet SUCCESS (counts toward settlement).
+   * - `owingMinor`: **remaining** liability for UI + net balance = gross unpaid minus pending checkouts.
+   */
   async getMechanicOwing(mechanicId: string) {
     const directPaid = await this.prisma.booking.findMany({
       where: {
@@ -501,13 +513,28 @@ export class WalletService {
       },
       select: { amountMinor: true },
     });
+    const pendingFeesAgg = await this.prisma.transaction.aggregate({
+      where: {
+        mechanicId,
+        type: TransactionType.MECHANIC_FEE,
+        status: TransactionStatus.PENDING,
+      },
+      _sum: { amountMinor: true },
+    });
 
     const totalFeeOwedMinor = directPaid.reduce(
-      (sum, b) => sum + Math.round((b.paidAmount ?? 0) * 100 * (PLATFORM_FEE_PERCENT / 100)),
+      (sum, b) => sum + directJobPlatformFeeMinorFromGrossNaira(b.paidAmount),
       0,
     );
     const totalPaidMinor = feesPaid.reduce((sum, t) => sum + t.amountMinor, 0);
-    const owingMinor = Math.max(0, totalFeeOwedMinor - totalPaidMinor);
+    const pendingFeeCheckoutsMinor = pendingFeesAgg._sum.amountMinor ?? 0;
+    const grossUnpaidAfterSuccessPaymentsMinor = Math.max(0, totalFeeOwedMinor - totalPaidMinor);
+    if (pendingFeeCheckoutsMinor > grossUnpaidAfterSuccessPaymentsMinor) {
+      this.logger.warn(
+        `Mechanic ${mechanicId}: pending MECHANIC_FEE (${pendingFeeCheckoutsMinor} kobo) exceeds gross fee due after SUCCESS (${grossUnpaidAfterSuccessPaymentsMinor} kobo). Remaining fee will show as 0; review stale checkouts.`,
+      );
+    }
+    const owingMinor = Math.max(0, grossUnpaidAfterSuccessPaymentsMinor - pendingFeeCheckoutsMinor);
 
     return {
       owingMinor,
@@ -515,6 +542,8 @@ export class WalletService {
       currency: 'NGN',
       totalFeeOwedMinor,
       totalFeePaidMinor: totalPaidMinor,
+      pendingFeeCheckoutsMinor,
+      grossUnpaidAfterSuccessPaymentsMinor,
     };
   }
 
@@ -644,8 +673,65 @@ export class WalletService {
     });
   }
 
+  /**
+   * Paystack often completes transfers before `transfer.success` is delivered or if the webhook
+   * URL/signature fails. Pending rows would stay forever and the app shows "finalizing" forever.
+   * For each in-flight payout with a `transferCode`, verify status via Paystack and finalize.
+   */
+  private async reconcilePendingMechanicTransferPayoutsFromPaystack(mechanicId: string): Promise<void> {
+    const rows = await this.prisma.transaction.findMany({
+      where: {
+        mechanicId,
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.PENDING,
+      },
+      select: { id: true, reference: true, amountMinor: true, metadata: true },
+    });
+
+    for (const row of rows) {
+      const meta = (row.metadata as Record<string, unknown> | null) || {};
+      const transferCode =
+        typeof meta.transferCode === 'string' ? meta.transferCode.trim() : '';
+      if (!transferCode) continue;
+
+      try {
+        const fetched = await this.paystack.fetchTransfer(transferCode);
+        if (!fetched) continue;
+
+        if (fetched.status === 'success') {
+          const out = await this.finalizeTransferPayoutFromWebhook({
+            reference: fetched.reference,
+            transferCode: fetched.transferCode,
+            amount: fetched.amount,
+            feeCharged: fetched.feeCharged,
+          });
+          if (out.applied) {
+            this.logger.log(
+              `PLATFORM_PAYOUT reconciled from Paystack transfer fetch mechanicId=${mechanicId} ref=${fetched.reference}`,
+            );
+          }
+        } else if (fetched.status === 'failed' || fetched.status === 'reversed') {
+          const applied = await this.failTransferPayoutFromWebhook(row.reference, {
+            reason: `paystack_${fetched.status}`,
+            event: 'reconcile.fetch',
+          });
+          if (applied.applied) {
+            this.logger.warn(
+              `PLATFORM_PAYOUT reconciled as FAILED from Paystack fetch ref=${row.reference} status=${fetched.status}`,
+            );
+          }
+        }
+      } catch (e) {
+        this.logger.warn(
+          `reconcile payout: Paystack fetch failed mechanicId=${mechanicId} rowRef=${row.reference} ${String(e)}`,
+        );
+      }
+    }
+  }
+
   /** Mechanic: Full wallet summary — single net balance + breakdown + recent transactions. */
   async getMechanicWalletSummary(mechanicId: string) {
+    await this.reconcilePendingMechanicTransferPayoutsFromPaystack(mechanicId);
     const [balance, owing, recent, pendingPlatformFeeCheckouts, pendingWithdrawals] = await Promise.all([
       this.getMechanicBalance(mechanicId),
       this.getMechanicOwing(mechanicId),
@@ -660,8 +746,14 @@ export class WalletService {
         netNaira: netMinor / 100,
         availableToWithdrawMinor: balance.balanceMinor,
         availableToWithdrawNaira: balance.balanceNaira,
+        /** Remaining platform fee debt after confirmed payments and in-flight Paystack checkouts. */
         unpaidPlatformFeeMinor: owing.owingMinor,
         unpaidPlatformFeeNaira: owing.owingNaira,
+        /** 20% still due on direct jobs before counting unfinished checkouts (for transparency). */
+        grossUnpaidPlatformFeeAfterSuccessMinor: owing.grossUnpaidAfterSuccessPaymentsMinor,
+        grossUnpaidPlatformFeeAfterSuccessNaira: owing.grossUnpaidAfterSuccessPaymentsMinor / 100,
+        pendingPlatformFeeCheckoutMinor: owing.pendingFeeCheckoutsMinor,
+        pendingPlatformFeeCheckoutNaira: owing.pendingFeeCheckoutsMinor / 100,
         totalEarnedFromPlatformMinor: balance.totalEarnedFromPlatformMinor,
         totalPayoutsMinor: balance.totalPayoutsMinor,
         pendingWithdrawalsMinor: balance.pendingWithdrawalsMinor,
@@ -701,7 +793,7 @@ export class WalletService {
       if (!booking.paidAt || booking.paidAmount == null) {
         throw new BadRequestException('Booking must be marked paid');
       }
-      const feeOwedMinor = Math.round((booking.paidAmount ?? 0) * 100 * (PLATFORM_FEE_PERCENT / 100));
+      const feeOwedMinor = directJobPlatformFeeMinorFromGrossNaira(booking.paidAmount);
       const paidAgg = await this.prisma.transaction.aggregate({
         where: {
           mechanicId,
@@ -729,16 +821,8 @@ export class WalletService {
         );
       }
     } else {
-      const pendingAll = await this.prisma.transaction.aggregate({
-        where: {
-          mechanicId,
-          type: TransactionType.MECHANIC_FEE,
-          status: TransactionStatus.PENDING,
-        },
-        _sum: { amountMinor: true },
-      });
-      const reservedMinor = pendingAll._sum.amountMinor ?? 0;
-      const availableMinor = Math.max(0, owing.owingMinor - reservedMinor);
+      /** Headroom for a new checkout = remaining after existing pending rows (see getMechanicOwing). */
+      const availableMinor = owing.owingMinor;
       if (amountMinor > availableMinor) {
         throw new BadRequestException(
           availableMinor <= 0
@@ -1086,14 +1170,14 @@ export class WalletService {
       | undefined;
 
     if (b && grossNaira != null && grossNaira > 0) {
-      const grossMinor = Math.round(grossNaira * 100);
-      const platformKeepsMinor = Math.round(grossMinor * (PLATFORM_FEE_PERCENT / 100));
-      const mechanicShareMinor = grossMinor - platformKeepsMinor;
+      const grossMinor = grossNairaToKobo(grossNaira);
+      const platformKeepsMinor = platformKeepsMinorFromGrossKobo(grossMinor);
+      const mechanicShareMinor = mechanicShareMinorFromGrossKobo(grossMinor);
       if (b.paymentMethod === PaymentMethod.PLATFORM) {
         feeSplit = {
           grossNaira,
           platformFeePercent: PLATFORM_FEE_PERCENT,
-          mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
+          mechanicSharePercent: MECHANIC_SHARE_PERCENT,
           platformKeepsNaira: platformKeepsMinor / 100,
           mechanicShareNaira: mechanicShareMinor / 100,
           directFeeOwedNaira: null,
@@ -1102,7 +1186,7 @@ export class WalletService {
         feeSplit = {
           grossNaira,
           platformFeePercent: PLATFORM_FEE_PERCENT,
-          mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
+          mechanicSharePercent: MECHANIC_SHARE_PERCENT,
           platformKeepsNaira: null,
           mechanicShareNaira: grossNaira,
           directFeeOwedNaira: platformKeepsMinor / 100,
@@ -1148,7 +1232,7 @@ export class WalletService {
       if (feeSplit.mechanicShareNaira != null && t.type !== TransactionType.MECHANIC_FEE) {
         lines.push({
           label: 'Your share (accrued)',
-          value: `\u20A6${feeSplit.mechanicShareNaira.toLocaleString()} (${100 - PLATFORM_FEE_PERCENT}%)`,
+          value: `\u20A6${feeSplit.mechanicShareNaira.toLocaleString()} (${MECHANIC_SHARE_PERCENT}%)`,
         });
       }
       if (feeSplit.directFeeOwedNaira != null) {
@@ -1213,14 +1297,16 @@ export class WalletService {
     });
     if (!t) throw new NotFoundException('Transaction not found');
     const grossNaira = t.booking?.paidAmount != null ? Number(t.booking.paidAmount) : null;
+    const grossKobo =
+      grossNaira != null && grossNaira > 0 ? grossNairaToKobo(grossNaira) : 0;
     const feeSplit =
       t.booking && grossNaira != null && grossNaira > 0
         ? {
             grossNaira,
             platformFeePercent: PLATFORM_FEE_PERCENT,
-            mechanicSharePercent: 100 - PLATFORM_FEE_PERCENT,
-            platformKeepsNaira: Math.round(grossNaira * 100 * (PLATFORM_FEE_PERCENT / 100)) / 100,
-            mechanicShareNaira: Math.round(grossNaira * 100 * (1 - PLATFORM_FEE_PERCENT / 100)) / 100,
+            mechanicSharePercent: MECHANIC_SHARE_PERCENT,
+            platformKeepsNaira: platformKeepsMinorFromGrossKobo(grossKobo) / 100,
+            mechanicShareNaira: mechanicShareMinorFromGrossKobo(grossKobo) / 100,
           }
         : undefined;
     return {
@@ -1253,7 +1339,7 @@ export class WalletService {
               },
               {
                 label: 'Platform & mechanic split',
-                value: `${PLATFORM_FEE_PERCENT}% / ${100 - PLATFORM_FEE_PERCENT}%`,
+                value: `${PLATFORM_FEE_PERCENT}% / ${MECHANIC_SHARE_PERCENT}%`,
               },
             ]
           : []),
@@ -1308,35 +1394,67 @@ export class WalletService {
     amount?: number;
     feeCharged?: number;
   }): Promise<{ applied: boolean; duplicate?: boolean; reason?: string }> {
-    const reference = params.reference.trim();
-    if (!reference) return { applied: false, reason: 'no_reference' };
+    const reference = (params.reference ?? '').trim();
+    const transferCodeParam = params.transferCode?.trim() ?? '';
 
-    const already = await this.prisma.transaction.findFirst({
-      where: {
-        type: TransactionType.PLATFORM_PAYOUT,
-        status: TransactionStatus.SUCCESS,
-        reference,
-      },
-    });
-    if (already) {
-      return { applied: false, duplicate: true };
+    if (!reference && !transferCodeParam) {
+      return { applied: false, reason: 'no_reference' };
     }
 
-    const pending = await this.prisma.transaction.findFirst({
-      where: {
-        type: TransactionType.PLATFORM_PAYOUT,
-        status: TransactionStatus.PENDING,
-        reference,
-      },
-    });
+    let pending =
+      reference.length > 0
+        ? await this.prisma.transaction.findFirst({
+            where: {
+              type: TransactionType.PLATFORM_PAYOUT,
+              status: TransactionStatus.PENDING,
+              reference,
+            },
+          })
+        : null;
+
+    if (!pending && transferCodeParam) {
+      pending = await this.prisma.transaction.findFirst({
+        where: {
+          type: TransactionType.PLATFORM_PAYOUT,
+          status: TransactionStatus.PENDING,
+          metadata: {
+            path: ['transferCode'],
+            equals: transferCodeParam,
+          },
+        },
+      });
+    }
+
     if (!pending) {
-      this.logger.warn(`transfer webhook: no PENDING payout for reference=${reference}`);
+      this.logger.warn(
+        `transfer webhook: no PENDING payout for reference=${reference || '(none)'} transferCode=${transferCodeParam || '(none)'}`,
+      );
       return { applied: false, reason: 'no_pending' };
     }
 
-    if (params.amount != null && params.amount !== pending.amountMinor) {
+    if (reference && pending.reference !== reference) {
       this.logger.error(
-        `transfer webhook: amount mismatch ref=${reference} expected=${pending.amountMinor} got=${params.amount}`,
+        `transfer webhook: reference mismatch db=${pending.reference} payload=${reference}`,
+      );
+      return { applied: false, reason: 'reference_mismatch' };
+    }
+
+    const alreadyFinalized = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.SUCCESS,
+        reference: pending.reference,
+      },
+    });
+    if (alreadyFinalized) {
+      return { applied: false, duplicate: true };
+    }
+
+    const webhookAmount =
+      params.amount != null && !Number.isNaN(Number(params.amount)) ? Math.round(Number(params.amount)) : undefined;
+    if (webhookAmount != null && webhookAmount !== pending.amountMinor) {
+      this.logger.error(
+        `transfer webhook: amount mismatch ref=${pending.reference} expected=${pending.amountMinor} got=${webhookAmount}`,
       );
       return { applied: false, reason: 'amount_mismatch' };
     }
@@ -1423,27 +1541,49 @@ export class WalletService {
   /** Route Paystack transfer lifecycle webhooks (configure in Paystack Dashboard). */
   async applyPaystackTransferWebhook(event: string, data: Record<string, unknown>): Promise<void> {
     const reference = typeof data.reference === 'string' ? data.reference.trim() : '';
-    if (!reference) {
-      this.logger.warn(`Paystack transfer webhook ${event}: missing reference`);
+    const transferCode =
+      typeof data.transfer_code === 'string'
+        ? data.transfer_code.trim()
+        : typeof data.transferCode === 'string'
+          ? data.transferCode.trim()
+          : '';
+
+    if (!reference && !transferCode) {
+      this.logger.warn(`Paystack transfer webhook ${event}: missing reference and transfer_code`);
       return;
     }
 
+    const parseAmount = (raw: unknown): number | undefined => {
+      if (typeof raw === 'number' && !Number.isNaN(raw)) return Math.round(raw);
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const n = Number(raw);
+        if (!Number.isNaN(n)) return Math.round(n);
+      }
+      return undefined;
+    };
+
+    const parseFee = (raw: unknown): number | undefined => {
+      if (typeof raw === 'number' && !Number.isNaN(raw)) return raw;
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const n = Number(raw);
+        if (!Number.isNaN(n)) return n;
+      }
+      return undefined;
+    };
+
     if (event === 'transfer.success') {
-      const amount = typeof data.amount === 'number' ? data.amount : undefined;
+      const amount = parseAmount(data.amount);
       const fee =
-        typeof data.fee_charged === 'number'
-          ? data.fee_charged
-          : typeof data.feeCharged === 'number'
-            ? data.feeCharged
-            : undefined;
-      const transferCode = typeof data.transfer_code === 'string' ? data.transfer_code : undefined;
+        parseFee(data.fee_charged) ?? parseFee(data.feeCharged);
       const out = await this.finalizeTransferPayoutFromWebhook({
         reference,
-        transferCode,
+        transferCode: transferCode || undefined,
         amount,
         feeCharged: fee,
       });
-      this.logger.log(`transfer.success ref=${reference} result=${JSON.stringify(out)}`);
+      this.logger.log(
+        `transfer.success ref=${reference || '(by transfer_code)'} transferCode=${transferCode || '(none)'} result=${JSON.stringify(out)}`,
+      );
       return;
     }
 
@@ -1455,8 +1595,33 @@ export class WalletService {
         typeof data.reason === 'string'
           ? data.reason
           : [failures, gateway, event].filter(Boolean).join(' · ') || event;
-      await this.failTransferPayoutFromWebhook(reference, { reason, event });
+      const refForFail = reference || (await this.resolveReferenceFromTransferCodeForWebhook(transferCode));
+      if (!refForFail) {
+        this.logger.warn(
+          `Paystack ${event}: could not resolve reference (reference empty, transfer_code=${transferCode || 'empty'})`,
+        );
+        return;
+      }
+      await this.failTransferPayoutFromWebhook(refForFail, { reason, event });
     }
+  }
+
+  /** Best-effort lookup of our payout reference when webhook only includes transfer_code. */
+  private async resolveReferenceFromTransferCodeForWebhook(transferCode: string): Promise<string> {
+    const code = transferCode.trim();
+    if (!code) return '';
+    const row = await this.prisma.transaction.findFirst({
+      where: {
+        type: TransactionType.PLATFORM_PAYOUT,
+        status: TransactionStatus.PENDING,
+        metadata: {
+          path: ['transferCode'],
+          equals: code,
+        },
+      },
+      select: { reference: true },
+    });
+    return row?.reference ?? '';
   }
 
   /**

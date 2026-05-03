@@ -263,7 +263,12 @@ export class AdminService {
         return { ...rest, defaultBankAccount: defaultBank, balance, owing };
       }),
     );
-    return withBalance.filter((m) => m.balance.balanceMinor > 0 || m.owing.owingNaira > 0);
+    return withBalance.filter(
+      (m) =>
+        m.balance.balanceMinor > 0 ||
+        m.owing.totalFeeOwedMinor > m.owing.totalFeePaidMinor ||
+        (m.owing.pendingFeeCheckoutsMinor ?? 0) > 0,
+    );
   }
 
   async recordPayout(mechanicId: string, amountMinor: number, reference: string | undefined, adminId: string) {
