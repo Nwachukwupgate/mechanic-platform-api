@@ -32,6 +32,7 @@ import {
 @Injectable()
 export class WalletService {
   private readonly logger = new Logger(WalletService.name);
+  private static readonly AUTO_FEE_SETTLEMENT_SOURCE = 'auto_wallet_net';
 
   constructor(
     private prisma: PrismaService,
@@ -451,7 +452,7 @@ export class WalletService {
       },
       select: { paidAmount: true },
     });
-    const [payoutsSuccess, pendingWithdrawAgg] = await Promise.all([
+    const [payoutsSuccess, pendingWithdrawAgg, autoFeeSettledAgg] = await Promise.all([
       db.transaction.findMany({
         where: {
           mechanicId,
@@ -468,6 +469,18 @@ export class WalletService {
         },
         _sum: { amountMinor: true },
       }),
+      db.transaction.aggregate({
+        where: {
+          mechanicId,
+          type: TransactionType.MECHANIC_FEE,
+          status: TransactionStatus.SUCCESS,
+          metadata: {
+            path: ['source'],
+            equals: WalletService.AUTO_FEE_SETTLEMENT_SOURCE,
+          },
+        },
+        _sum: { amountMinor: true },
+      }),
     ]);
 
     const totalEarnedMinor = platformPaid.reduce(
@@ -476,8 +489,12 @@ export class WalletService {
     );
     const totalPayoutMinor = payoutsSuccess.reduce((sum, t) => sum + t.amountMinor, 0);
     const pendingWithdrawalsMinor = pendingWithdrawAgg._sum.amountMinor ?? 0;
+    const totalAutoFeeSettledMinor = autoFeeSettledAgg._sum.amountMinor ?? 0;
     /** Amount the mechanic can withdraw right now (excludes in-flight PAYOUT rows). */
-    const balanceMinor = Math.max(0, totalEarnedMinor - totalPayoutMinor - pendingWithdrawalsMinor);
+    const balanceMinor = Math.max(
+      0,
+      totalEarnedMinor - totalPayoutMinor - pendingWithdrawalsMinor - totalAutoFeeSettledMinor,
+    );
 
     return {
       balanceMinor,
@@ -486,7 +503,54 @@ export class WalletService {
       totalEarnedFromPlatformMinor: totalEarnedMinor,
       totalPayoutsMinor: totalPayoutMinor,
       pendingWithdrawalsMinor,
+      totalAutoFeeSettledMinor,
     };
+  }
+
+  /**
+   * Auto-settle direct-job platform fee debt from wallet earnings.
+   * Creates SUCCESS MECHANIC_FEE rows so settlement is visible in transaction history.
+   */
+  private async maybeAutoSettleMechanicFeeFromWallet(
+    mechanicId: string,
+    txClient?: Prisma.TransactionClient,
+  ): Promise<number> {
+    const run = async (db: Prisma.TransactionClient | PrismaService): Promise<number> => {
+      const balance = await this.getMechanicBalance(mechanicId, db as Prisma.TransactionClient);
+      const owing = await this.getMechanicOwing(mechanicId, db as Prisma.TransactionClient);
+      const toSettleMinor = Math.min(balance.balanceMinor, owing.owingMinor);
+      if (toSettleMinor <= 0) return 0;
+
+      await db.transaction.create({
+        data: {
+          type: TransactionType.MECHANIC_FEE,
+          amountMinor: toSettleMinor,
+          currency: 'NGN',
+          status: TransactionStatus.SUCCESS,
+          reference: `auto_fee_${randomBytes(8).toString('hex')}`,
+          mechanicId,
+          description: 'Auto-settled platform fee from wallet earnings',
+          metadata: {
+            source: WalletService.AUTO_FEE_SETTLEMENT_SOURCE,
+            kind: 'AUTO_PLATFORM_FEE_SETTLEMENT',
+          },
+        },
+      });
+      this.logger.log(
+        `Mechanic ${mechanicId}: auto-settled ₦${(toSettleMinor / 100).toLocaleString()} from wallet earnings`,
+      );
+      return toSettleMinor;
+    };
+
+    if (txClient) return run(txClient);
+    return this.prisma.$transaction(
+      async (tx) => run(tx),
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        maxWait: 5000,
+        timeout: 15000,
+      },
+    );
   }
 
   /**
@@ -495,8 +559,9 @@ export class WalletService {
    * - `pendingFeeCheckoutsMinor`: Paystack checkouts started but not yet SUCCESS (counts toward settlement).
    * - `owingMinor`: **remaining** liability for UI + net balance = gross unpaid minus pending checkouts.
    */
-  async getMechanicOwing(mechanicId: string) {
-    const directPaid = await this.prisma.booking.findMany({
+  async getMechanicOwing(mechanicId: string, tx?: Prisma.TransactionClient) {
+    const db = tx ?? this.prisma;
+    const directPaid = await db.booking.findMany({
       where: {
         mechanicId,
         paymentMethod: PaymentMethod.DIRECT,
@@ -505,7 +570,7 @@ export class WalletService {
       },
       select: { paidAmount: true },
     });
-    const feesPaid = await this.prisma.transaction.findMany({
+    const feesPaid = await db.transaction.findMany({
       where: {
         mechanicId,
         type: TransactionType.MECHANIC_FEE,
@@ -513,7 +578,7 @@ export class WalletService {
       },
       select: { amountMinor: true },
     });
-    const pendingFeesAgg = await this.prisma.transaction.aggregate({
+    const pendingFeesAgg = await db.transaction.aggregate({
       where: {
         mechanicId,
         type: TransactionType.MECHANIC_FEE,
@@ -732,6 +797,7 @@ export class WalletService {
   /** Mechanic: Full wallet summary — single net balance + breakdown + recent transactions. */
   async getMechanicWalletSummary(mechanicId: string) {
     await this.reconcilePendingMechanicTransferPayoutsFromPaystack(mechanicId);
+    await this.maybeAutoSettleMechanicFeeFromWallet(mechanicId);
     const [balance, owing, recent, pendingPlatformFeeCheckouts, pendingWithdrawals] = await Promise.all([
       this.getMechanicBalance(mechanicId),
       this.getMechanicOwing(mechanicId),
@@ -756,6 +822,7 @@ export class WalletService {
         pendingPlatformFeeCheckoutNaira: owing.pendingFeeCheckoutsMinor / 100,
         totalEarnedFromPlatformMinor: balance.totalEarnedFromPlatformMinor,
         totalPayoutsMinor: balance.totalPayoutsMinor,
+        totalAutoFeeSettledMinor: balance.totalAutoFeeSettledMinor,
         pendingWithdrawalsMinor: balance.pendingWithdrawalsMinor,
         totalFeeOwedMinor: owing.totalFeeOwedMinor,
         totalFeePaidMinor: owing.totalFeePaidMinor,
@@ -780,6 +847,7 @@ export class WalletService {
       throw new BadRequestException('Minimum amount is \u20A61 (100 kobo)');
     }
 
+    await this.maybeAutoSettleMechanicFeeFromWallet(mechanicId);
     const owing = await this.getMechanicOwing(mechanicId);
 
     if (bookingId) {
@@ -1644,6 +1712,7 @@ export class WalletService {
           const mechanic = await tx.mechanic.findUnique({ where: { id: mechanicId } });
           if (!mechanic) throw new NotFoundException('Mechanic not found');
 
+          await this.maybeAutoSettleMechanicFeeFromWallet(mechanicId, tx);
           const balance = await this.getMechanicBalance(mechanicId, tx);
           if (amountMinor <= 0) throw new BadRequestException('Amount must be positive');
           if (amountMinor > balance.balanceMinor) {
@@ -1796,6 +1865,7 @@ export class WalletService {
   async recordPayout(mechanicId: string, amountMinor: number, reference?: string, adminId?: string) {
     const mechanic = await this.prisma.mechanic.findUnique({ where: { id: mechanicId } });
     if (!mechanic) throw new NotFoundException('Mechanic not found');
+    await this.maybeAutoSettleMechanicFeeFromWallet(mechanicId);
     const balance = await this.getMechanicBalance(mechanicId);
     if (amountMinor <= 0) throw new BadRequestException('Amount must be positive');
     if (amountMinor > balance.balanceMinor) {
