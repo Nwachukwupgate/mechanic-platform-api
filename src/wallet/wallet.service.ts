@@ -452,7 +452,7 @@ export class WalletService {
       },
       select: { paidAmount: true },
     });
-    const [payoutsSuccess, pendingWithdrawAgg, autoFeeSettledAgg] = await Promise.all([
+    const [payoutsSuccess, pendingWithdrawAgg, autoFeeSettledAgg, adminCreditAgg, adminDebitAgg] = await Promise.all([
       db.transaction.findMany({
         where: {
           mechanicId,
@@ -481,6 +481,22 @@ export class WalletService {
         },
         _sum: { amountMinor: true },
       }),
+      db.transaction.aggregate({
+        where: {
+          mechanicId,
+          type: TransactionType.ADMIN_MECHANIC_CREDIT,
+          status: TransactionStatus.SUCCESS,
+        },
+        _sum: { amountMinor: true },
+      }),
+      db.transaction.aggregate({
+        where: {
+          mechanicId,
+          type: TransactionType.ADMIN_MECHANIC_DEBIT,
+          status: TransactionStatus.SUCCESS,
+        },
+        _sum: { amountMinor: true },
+      }),
     ]);
 
     const totalEarnedMinor = platformPaid.reduce(
@@ -490,10 +506,17 @@ export class WalletService {
     const totalPayoutMinor = payoutsSuccess.reduce((sum, t) => sum + t.amountMinor, 0);
     const pendingWithdrawalsMinor = pendingWithdrawAgg._sum.amountMinor ?? 0;
     const totalAutoFeeSettledMinor = autoFeeSettledAgg._sum.amountMinor ?? 0;
+    const totalAdminCreditMinor = adminCreditAgg._sum.amountMinor ?? 0;
+    const totalAdminDebitMinor = adminDebitAgg._sum.amountMinor ?? 0;
+    const adminLedgerNetMinor = totalAdminCreditMinor - totalAdminDebitMinor;
     /** Amount the mechanic can withdraw right now (excludes in-flight PAYOUT rows). */
     const balanceMinor = Math.max(
       0,
-      totalEarnedMinor - totalPayoutMinor - pendingWithdrawalsMinor - totalAutoFeeSettledMinor,
+      totalEarnedMinor -
+        totalPayoutMinor -
+        pendingWithdrawalsMinor -
+        totalAutoFeeSettledMinor +
+        adminLedgerNetMinor,
     );
 
     return {
@@ -504,6 +527,8 @@ export class WalletService {
       totalPayoutsMinor: totalPayoutMinor,
       pendingWithdrawalsMinor,
       totalAutoFeeSettledMinor,
+      totalAdminCreditMinor,
+      totalAdminDebitMinor,
     };
   }
 
@@ -1284,6 +1309,10 @@ export class WalletService {
       lines.push({ label: 'Type', value: 'Customer payment via platform' });
     } else if (t.type === TransactionType.REFUND) {
       lines.push({ label: 'Type', value: 'Refund' });
+    } else if (t.type === TransactionType.ADMIN_MECHANIC_CREDIT) {
+      lines.push({ label: 'Type', value: 'Admin wallet credit (support adjustment)' });
+    } else if (t.type === TransactionType.ADMIN_MECHANIC_DEBIT) {
+      lines.push({ label: 'Type', value: 'Admin wallet debit (support adjustment)' });
     }
 
     if (feeSplit) {

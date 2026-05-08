@@ -42,6 +42,10 @@ enum TransactionType {
   PLATFORM_PAYOUT // Platform paid mechanic their 80%
   MECHANIC_FEE // Mechanic paid platform their 20% (for direct bookings)
   REFUND // Platform refunded user
+  /** Ledger-only: admin credited mechanic wallet (support adjustment). */
+  ADMIN_MECHANIC_CREDIT
+  /** Ledger-only: admin debited mechanic wallet (support clawback). */
+  ADMIN_MECHANIC_DEBIT
 }
 
 enum TransactionStatus {
@@ -117,6 +121,11 @@ model User {
   role          UserRole  @default(USER)
   emailVerified Boolean   @default(false)
   emailToken    String?
+  /**
+   * When role is ADMIN: granular permission keys (string[] in JSON).
+   * null or empty array = superadmin (all permissions).
+   */
+  adminPermissions Json?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -128,6 +137,22 @@ model User {
   transactions Transaction[]
   blockedMechanics UserBlocksMechanic[]
   expoPushToken    String?
+  adminAuditLogs   AdminAuditLog[]
+}
+
+model AdminAuditLog {
+  id         String   @id @default(uuid())
+  adminId    String
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  admin User @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId, createdAt])
+  @@index([entityType, entityId])
 }
 
 model UserProfile {

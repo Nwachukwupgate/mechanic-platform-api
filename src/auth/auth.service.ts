@@ -243,6 +243,9 @@ export class AuthService {
         id: user.id,
         email: user.email,
         role: role,
+        ...(role === UserRole.ADMIN && {
+          adminPermissions: (user as any).adminPermissions ?? null,
+        }),
       },
     };
   }
