@@ -7,9 +7,7 @@ const prisma = new PrismaClient();
 async function main() {
   console.log('🌱 Starting database seed...')
 
-  // Clear existing faults
-  // await prisma.fault.deleteMany()
-  console.log('✅ Cleared existing faults')
+  // Faults: idempotent create by name below (no wipe).
 
   // Seed Faults
   const faults = [
@@ -62,6 +60,18 @@ async function main() {
         { question: 'Where is the oil leaking from?', type: 'text' },
         { question: 'How much oil is being lost?', type: 'text' },
         { question: 'When did you first notice the leak?', type: 'text' },
+      ],
+    },
+    /** ENGINE → matches MECHANICAL expertise (see mapFaultCategoryToExpertise). */
+    {
+      category: FaultCategory.ENGINE,
+      name: 'Other mechanical issue (not listed)',
+      description:
+        'Engine, drivetrain, or related mechanical problem not covered above. Use notes and photos to explain.',
+      questions: [
+        { question: 'What are the main symptoms?', type: 'text' },
+        { question: 'When did it start?', type: 'text' },
+        { question: 'Any warning lights or unusual sounds?', type: 'text' },
       ],
     },
 
@@ -166,6 +176,17 @@ async function main() {
         { question: 'Which windows are affected?', type: 'text' },
         { question: 'Do you hear any motor sounds?', type: 'yes_no' },
         { question: 'When did they stop working?', type: 'text' },
+      ],
+    },
+    {
+      category: FaultCategory.ELECTRICAL,
+      name: 'Other electrical issue (not listed)',
+      description:
+        'Lights, sensors, wiring, accessories, or other electrical work not covered above. Add details and photos below.',
+      questions: [
+        { question: 'What symptoms or parts are involved?', type: 'text' },
+        { question: 'Any warning lights or blown fuses?', type: 'text' },
+        { question: 'Anything else we should know?', type: 'text' },
       ],
     },
 
@@ -316,13 +337,20 @@ async function main() {
     },
   ]
 
-  // for (const fault of faults) {
-  //   await prisma.fault.create({
-  //     data: fault,
-  //   })
-  // }
-
-  console.log(`✅ Seeded ${faults.length} faults`);
+  let faultsCreated = 0
+  let faultsSkipped = 0
+  for (const fault of faults) {
+    const exists = await prisma.fault.findFirst({
+      where: { name: fault.name },
+    })
+    if (exists) {
+      faultsSkipped++
+      continue
+    }
+    await prisma.fault.create({ data: fault })
+    faultsCreated++
+  }
+  console.log(`✅ Faults: created ${faultsCreated}, skipped ${faultsSkipped} (already in database)`)
 
   // Create default admin user if env ADMIN_EMAIL and ADMIN_PASSWORD are set
   const adminEmail = process.env.ADMIN_EMAIL;
