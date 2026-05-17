@@ -1,8 +1,23 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../common/prisma/prisma.service';
-import { BookingStatus, UserRole, QuoteStatus } from '@prisma/client';
+import {
+  BookingStatus,
+  UserRole,
+  QuoteStatus,
+  InvoiceStatus,
+  InvoiceSource,
+} from '@prisma/client';
 import { LocationService } from '../location/location.service';
+import { SettlementService } from '../settlement/settlement.service';
+import { buildPricingSummary, settlementToPricingSummary } from '../settlement/pricing-summary';
+import { minorToNaira } from '../settlement/settlement-amounts';
+import {
+  InvoicePricingInput,
+  QuotePricingInput,
+  resolveInvoicePricing,
+  resolveQuotePricing,
+} from './booking-pricing.util';
 
 const OPEN_REQUEST_EXPIRY_DAYS = 7;
 /** Max times the mechanic can change the quoted price after first submit (per booking). */
@@ -14,6 +29,7 @@ export class BookingsService {
     private prisma: PrismaService,
     private locationService: LocationService,
     private eventEmitter: EventEmitter2,
+    private settlementService: SettlementService,
   ) {}
 
   /** Expire open-board jobs past `openRequestExpiresAt`. */
@@ -275,6 +291,9 @@ export class BookingsService {
           take: 30,
         },
         ratings: { take: 1, select: { id: true, rating: true } },
+        invoices: { orderBy: { version: 'desc' } },
+        settlement: true,
+        acceptedQuote: true,
       },
     });
 
@@ -282,13 +301,93 @@ export class BookingsService {
       throw new NotFoundException('Booking not found');
     }
 
+    const enriched = await this.attachPricingToBooking(booking);
+
     // Chat only after the job leaves REQUESTED (e.g. user accepted a quote or legacy accept)
     const chatReleased =
       booking.mechanicId != null && booking.status !== BookingStatus.REQUESTED;
     if (!chatReleased) {
-      return { ...booking, messages: [] };
+      return { ...enriched, messages: [] };
     }
-    return booking;
+    return enriched;
+  }
+
+  private async attachPricingToBooking(booking: any) {
+    const activeInvoice =
+      booking.invoices?.find((i: { status: string }) => i.status === InvoiceStatus.ACCEPTED) ??
+      booking.invoices?.find((i: { status: string }) => i.status === InvoiceStatus.SUBMITTED) ??
+      booking.invoices?.[0];
+
+    let breakdown: {
+      partsMinor: number;
+      labourMinor: number;
+      otherFeesMinor: number;
+      customerTotalMinor: number;
+    } | null = null;
+
+    if (activeInvoice) {
+      breakdown = {
+        partsMinor: activeInvoice.partsMinor,
+        labourMinor: activeInvoice.labourMinor,
+        otherFeesMinor: activeInvoice.otherFeesMinor,
+        customerTotalMinor: activeInvoice.customerTotalMinor,
+      };
+    } else if (booking.acceptedQuote?.customerTotalMinor) {
+      breakdown = {
+        partsMinor: booking.acceptedQuote.partsMinor ?? 0,
+        labourMinor: booking.acceptedQuote.labourMinor ?? 0,
+        otherFeesMinor: booking.acceptedQuote.otherFeesMinor ?? 0,
+        customerTotalMinor: booking.acceptedQuote.customerTotalMinor,
+      };
+    } else if (booking.estimatedCost != null && booking.estimatedCost > 0) {
+      const totalMinor = Math.round(booking.estimatedCost * 100);
+      breakdown = {
+        partsMinor: 0,
+        labourMinor: totalMinor,
+        otherFeesMinor: 0,
+        customerTotalMinor: totalMinor,
+      };
+    }
+
+    const pricingSummary = booking.settlement
+      ? settlementToPricingSummary(booking.settlement)
+      : buildPricingSummary(breakdown);
+
+    const mapQuote = (q: any) => ({
+      ...q,
+      partsNaira: q.partsMinor != null ? minorToNaira(q.partsMinor) : null,
+      labourNaira: q.labourMinor != null ? minorToNaira(q.labourMinor) : null,
+      otherFeesNaira: q.otherFeesMinor != null ? minorToNaira(q.otherFeesMinor) : null,
+      customerTotalNaira:
+        q.customerTotalMinor != null ? minorToNaira(q.customerTotalMinor) : q.proposedPrice,
+    });
+
+    return {
+      ...booking,
+      quotes: booking.quotes?.map(mapQuote),
+      acceptedQuote: booking.acceptedQuote ? mapQuote(booking.acceptedQuote) : null,
+      activeInvoice: activeInvoice
+        ? {
+            ...activeInvoice,
+            partsNaira: minorToNaira(activeInvoice.partsMinor),
+            labourNaira: minorToNaira(activeInvoice.labourMinor),
+            otherFeesNaira: minorToNaira(activeInvoice.otherFeesMinor),
+            customerTotalNaira: minorToNaira(activeInvoice.customerTotalMinor),
+          }
+        : null,
+      pricingSummary,
+      settlement: booking.settlement
+        ? {
+            ...booking.settlement,
+            customerTotalNaira: minorToNaira(booking.settlement.customerTotalMinor),
+            partsNaira: minorToNaira(booking.settlement.partsMinor),
+            labourNaira: minorToNaira(booking.settlement.labourMinor),
+            otherFeesNaira: minorToNaira(booking.settlement.otherFeesMinor),
+            platformFeeNaira: minorToNaira(booking.settlement.platformFeeMinor),
+            mechanicEarningsNaira: minorToNaira(booking.settlement.mechanicEarningsMinor),
+          }
+        : null,
+    };
   }
 
   async acceptBooking(bookingId: string, mechanicId: string) {
@@ -351,18 +450,127 @@ export class BookingsService {
   }
 
   async updateCost(bookingId: string, cost: number, userId: string, role: UserRole) {
-    const booking = await this.findById(bookingId);
-
-    if (role !== UserRole.MECHANIC || booking.mechanicId !== userId) {
+    if (role !== UserRole.MECHANIC) {
       throw new NotFoundException('Booking not found');
     }
+    return this.upsertInvoice(bookingId, userId, {
+      partsCost: 0,
+      labourCost: cost,
+      otherFees: 0,
+    });
+  }
 
-    return this.prisma.booking.update({
+  /** Mechanic: structured job costing (parts / labour / other). */
+  async upsertInvoice(bookingId: string, mechanicId: string, input: InvoicePricingInput) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.mechanicId !== mechanicId) {
+      throw new NotFoundException('Booking not found');
+    }
+    const closedStatuses: BookingStatus[] = [
+      BookingStatus.PAID,
+      BookingStatus.DELIVERED,
+      BookingStatus.EXPIRED,
+    ];
+    if (closedStatuses.includes(booking.status)) {
+      throw new BadRequestException('Cannot update costing on a closed booking');
+    }
+
+    const pricing = resolveInvoicePricing(input);
+    const existingDraft = await this.prisma.bookingInvoice.findFirst({
+      where: { bookingId, mechanicId, status: InvoiceStatus.DRAFT },
+      orderBy: { version: 'desc' },
+    });
+
+    let invoice;
+    if (existingDraft) {
+      invoice = await this.prisma.bookingInvoice.update({
+        where: { id: existingDraft.id },
+        data: {
+          partsMinor: pricing.partsMinor,
+          labourMinor: pricing.labourMinor,
+          otherFeesMinor: pricing.otherFeesMinor,
+          customerTotalMinor: pricing.customerTotalMinor,
+          notes: input.notes ?? existingDraft.notes,
+        },
+      });
+    } else {
+      const maxVersion = await this.prisma.bookingInvoice.aggregate({
+        where: { bookingId },
+        _max: { version: true },
+      });
+      invoice = await this.prisma.bookingInvoice.create({
+        data: {
+          bookingId,
+          mechanicId,
+          version: (maxVersion._max.version ?? 0) + 1,
+          status: InvoiceStatus.DRAFT,
+          partsMinor: pricing.partsMinor,
+          labourMinor: pricing.labourMinor,
+          otherFeesMinor: pricing.otherFeesMinor,
+          customerTotalMinor: pricing.customerTotalMinor,
+          notes: input.notes ?? null,
+          source: InvoiceSource.MECHANIC_MANUAL,
+        },
+      });
+    }
+
+    await this.prisma.booking.update({
       where: { id: bookingId },
       data: {
-        estimatedCost: cost,
+        estimatedCost: pricing.customerTotalNaira,
+        actualCost: pricing.customerTotalNaira,
       },
     });
+
+    return this.findById(bookingId);
+  }
+
+  async submitInvoice(bookingId: string, mechanicId: string) {
+    const invoice = await this.prisma.bookingInvoice.findFirst({
+      where: { bookingId, mechanicId, status: InvoiceStatus.DRAFT },
+      orderBy: { version: 'desc' },
+    });
+    if (!invoice) throw new BadRequestException('No draft invoice to submit');
+    await this.prisma.bookingInvoice.update({
+      where: { id: invoice.id },
+      data: { status: InvoiceStatus.SUBMITTED },
+    });
+    return this.findById(bookingId);
+  }
+
+  async acceptInvoice(bookingId: string, userId: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking || booking.userId !== userId) throw new NotFoundException('Booking not found');
+
+    const invoice = await this.prisma.bookingInvoice.findFirst({
+      where: {
+        bookingId,
+        status: { in: [InvoiceStatus.SUBMITTED, InvoiceStatus.DRAFT] },
+      },
+      orderBy: { version: 'desc' },
+    });
+    if (!invoice) throw new BadRequestException('No invoice awaiting acceptance');
+
+    await this.prisma.$transaction([
+      this.prisma.bookingInvoice.updateMany({
+        where: { bookingId, id: { not: invoice.id }, status: InvoiceStatus.ACCEPTED },
+        data: { status: InvoiceStatus.SUPERSEDED },
+      }),
+      this.prisma.bookingInvoice.update({
+        where: { id: invoice.id },
+        data: { status: InvoiceStatus.ACCEPTED, acceptedAt: new Date() },
+      }),
+      this.prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          estimatedCost: minorToNaira(invoice.customerTotalMinor),
+          actualCost: minorToNaira(invoice.customerTotalMinor),
+        },
+      }),
+    ]);
+
+    return this.findById(bookingId);
   }
 
   // --- Quote flow: mechanics submit/update price; user accepts or cancels one ---
@@ -382,7 +590,14 @@ export class BookingsService {
   }
 
   /** Submit or re-submit a quote. Mechanics can submit again after REJECTED (stay in the bargain). */
-  async createQuote(bookingId: string, mechanicId: string, proposedPrice: number, message?: string) {
+  async createQuote(
+    bookingId: string,
+    mechanicId: string,
+    input: QuotePricingInput & { message?: string },
+  ) {
+    const pricing = resolveQuotePricing(input);
+    const { proposedPrice, partsMinor, labourMinor, otherFeesMinor, customerTotalMinor } = pricing;
+    const message = input.message;
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
       include: { fault: true, vehicle: true },
@@ -413,12 +628,20 @@ export class BookingsService {
         bookingId,
         mechanicId,
         proposedPrice,
+        partsMinor,
+        labourMinor,
+        otherFeesMinor,
+        customerTotalMinor,
         message: message ?? null,
         status: QuoteStatus.PENDING,
         priceUpdateCount: 0,
       },
       update: {
         proposedPrice,
+        partsMinor,
+        labourMinor,
+        otherFeesMinor,
+        customerTotalMinor,
         message: message ?? undefined,
         status: QuoteStatus.PENDING,
         priceUpdateCount: { increment: 1 },
@@ -436,7 +659,9 @@ export class BookingsService {
   }
 
   /** Update price/message. Allowed for PENDING; also for REJECTED so mechanic can re-enter the bargain with a new price. */
-  async updateQuote(quoteId: string, mechanicId: string, proposedPrice: number) {
+  async updateQuote(quoteId: string, mechanicId: string, input: QuotePricingInput) {
+    const pricing = resolveQuotePricing(input);
+    const { proposedPrice, partsMinor, labourMinor, otherFeesMinor, customerTotalMinor } = pricing;
     const quote = await this.prisma.bookingQuote.findUnique({
       where: { id: quoteId },
       include: { booking: true },
@@ -459,6 +684,10 @@ export class BookingsService {
       where: { id: quoteId },
       data: {
         proposedPrice,
+        partsMinor,
+        labourMinor,
+        otherFeesMinor,
+        customerTotalMinor,
         priceUpdateCount: { increment: 1 },
         ...(quote.status === QuoteStatus.REJECTED ? { status: QuoteStatus.PENDING } : {}),
       },
@@ -530,28 +759,59 @@ export class BookingsService {
       throw new BadRequestException('Booking already has an accepted mechanic');
     }
 
-    await this.prisma.$transaction([
-      this.prisma.bookingQuote.update({
+    const partsMinor = quote.partsMinor ?? 0;
+    const labourMinor = quote.labourMinor ?? Math.round(quote.proposedPrice * 100);
+    const otherFeesMinor = quote.otherFeesMinor ?? 0;
+    const customerTotalMinor =
+      quote.customerTotalMinor ?? Math.round(quote.proposedPrice * 100);
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.bookingQuote.update({
         where: { id: quoteId },
         data: { status: QuoteStatus.ACCEPTED },
-      }),
-      this.prisma.bookingQuote.updateMany({
+      });
+      await tx.bookingQuote.updateMany({
         where: {
           bookingId: quote.bookingId,
           id: { not: quoteId },
         },
         data: { status: QuoteStatus.REJECTED },
-      }),
-      this.prisma.booking.update({
+      });
+      await tx.bookingInvoice.updateMany({
+        where: { bookingId: quote.bookingId, status: InvoiceStatus.ACCEPTED },
+        data: { status: InvoiceStatus.SUPERSEDED },
+      });
+      const maxVersion = await tx.bookingInvoice.aggregate({
+        where: { bookingId: quote.bookingId },
+        _max: { version: true },
+      });
+      await tx.bookingInvoice.create({
+        data: {
+          bookingId: quote.bookingId,
+          mechanicId: quote.mechanicId,
+          version: (maxVersion._max.version ?? 0) + 1,
+          status: InvoiceStatus.ACCEPTED,
+          partsMinor,
+          labourMinor,
+          otherFeesMinor,
+          customerTotalMinor,
+          source: InvoiceSource.FROM_QUOTE,
+          quoteId,
+          acceptedAt: new Date(),
+        },
+      });
+      await tx.booking.update({
         where: { id: quote.bookingId },
         data: {
           mechanicId: quote.mechanicId,
+          acceptedQuoteId: quoteId,
           estimatedCost: quote.proposedPrice,
+          actualCost: quote.proposedPrice,
           status: BookingStatus.ACCEPTED,
           acceptedAt: new Date(),
         },
-      }),
-    ]);
+      });
+    });
 
     const updatedBooking = await this.findById(quote.bookingId);
     this.eventEmitter.emit('quote.accepted', {

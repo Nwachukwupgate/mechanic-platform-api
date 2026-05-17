@@ -256,6 +256,9 @@ export class AdminService {
         vehicle: true,
         fault: true,
         quotes: { include: { mechanic: { select: { companyName: true } } } },
+        invoices: { orderBy: { version: 'desc' } },
+        settlement: true,
+        acceptedQuote: true,
         transactions: true,
       },
     });

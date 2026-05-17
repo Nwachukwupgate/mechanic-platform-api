@@ -160,14 +160,16 @@ export class BookingsController {
   async createQuote(
     @Param('id') id: string,
     @CurrentUser() mechanic: any,
-    @Body() body: { proposedPrice: number; message?: string },
+    @Body()
+    body: {
+      proposedPrice?: number;
+      partsCost?: number;
+      labourCost?: number;
+      otherFees?: number;
+      message?: string;
+    },
   ) {
-    return this.bookingsService.createQuote(
-      id,
-      mechanic.id,
-      body.proposedPrice,
-      body.message,
-    );
+    return this.bookingsService.createQuote(id, mechanic.id, body);
   }
 
   @UseGuards(RolesGuard)
@@ -177,9 +179,15 @@ export class BookingsController {
     @Param('id') id: string,
     @Param('quoteId') quoteId: string,
     @CurrentUser() mechanic: any,
-    @Body() body: { proposedPrice: number },
+    @Body()
+    body: {
+      proposedPrice?: number;
+      partsCost?: number;
+      labourCost?: number;
+      otherFees?: number;
+    },
   ) {
-    return this.bookingsService.updateQuote(quoteId, mechanic.id, body.proposedPrice);
+    return this.bookingsService.updateQuote(quoteId, mechanic.id, body);
   }
 
   @UseGuards(RolesGuard)
@@ -236,6 +244,29 @@ export class BookingsController {
     @Body() data: { cost: number },
   ) {
     return this.bookingsService.updateCost(id, data.cost, mechanic.id, UserRole.MECHANIC);
+  }
+
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Put(':id/invoice')
+  async upsertInvoice(
+    @Param('id') id: string,
+    @CurrentUser() mechanic: any,
+    @Body() body: { partsCost: number; labourCost: number; otherFees?: number; notes?: string },
+  ) {
+    return this.bookingsService.upsertInvoice(id, mechanic.id, body);
+  }
+
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.MECHANIC)
+  @Put(':id/invoice/submit')
+  async submitInvoice(@Param('id') id: string, @CurrentUser() mechanic: any) {
+    return this.bookingsService.submitInvoice(id, mechanic.id);
+  }
+
+  @Put(':id/invoice/accept')
+  async acceptInvoice(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.bookingsService.acceptInvoice(id, user.id);
   }
 
   @Put(':id/description')

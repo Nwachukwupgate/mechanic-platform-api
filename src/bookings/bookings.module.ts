@@ -4,9 +4,10 @@ import { BookingsController } from './bookings.controller';
 import { PrismaModule } from '../common/prisma/prisma.module';
 import { LocationModule } from '../location/location.module';
 import { CloudinaryModule } from '../cloudinary/cloudinary.module';
+import { SettlementModule } from '../settlement/settlement.module';
 
 @Module({
-  imports: [PrismaModule, LocationModule, CloudinaryModule],
+  imports: [PrismaModule, LocationModule, CloudinaryModule, SettlementModule],
   controllers: [BookingsController],
   providers: [BookingsService],
   exports: [BookingsService],

@@ -28,6 +28,8 @@ import {
   directJobPlatformFeeMinorFromGrossNaira,
   platformJobMechanicShareMinorFromGrossNaira,
 } from './mechanic-wallet-amounts';
+import { SettlementService } from '../settlement/settlement.service';
+import { minorToNaira } from '../settlement/settlement-amounts';
 
 @Injectable()
 export class WalletService {
@@ -39,6 +41,7 @@ export class WalletService {
     private paystack: PaystackService,
     private configService: ConfigService,
     private eventEmitter: EventEmitter2,
+    private settlementService: SettlementService,
   ) {}
 
   /** User: Initialize Paystack payment for a booking (platform flow). */
@@ -256,6 +259,13 @@ export class WalletService {
       },
     });
 
+    await this.settlementService.createSettlementForPaidBooking(
+      booking.id,
+      PaymentMethod.PLATFORM,
+      paymentTx.id,
+      txClient,
+    );
+
     this.eventEmitter.emit('booking.statusChanged', {
       bookingId: booking.id,
       status: BookingStatus.PAID,
@@ -332,6 +342,12 @@ export class WalletService {
             status: BookingStatus.PAID,
           },
         });
+        await this.settlementService.createSettlementForPaidBooking(
+          bookingId,
+          PaymentMethod.PLATFORM,
+          pendingId,
+          tx,
+        );
       });
     } catch (e) {
       this.logger.error(`finalize Paystack: DB error ref=${paystackRef} ${String(e)}`);
@@ -344,6 +360,12 @@ export class WalletService {
     if (!confirmed) {
       return { applied: false, duplicate: true };
     }
+
+    await this.settlementService.createSettlementForPaidBooking(
+      bookingId,
+      PaymentMethod.PLATFORM,
+      confirmed.id,
+    );
 
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (booking) {
@@ -378,6 +400,11 @@ export class WalletService {
         status: BookingStatus.PAID,
       },
     });
+
+    await this.settlementService.createSettlementForPaidBooking(
+      bookingId,
+      PaymentMethod.DIRECT,
+    );
 
     this.eventEmitter.emit('booking.statusChanged', {
       bookingId: updated.id,
@@ -443,12 +470,21 @@ export class WalletService {
    */
   async getMechanicBalance(mechanicId: string, tx?: Prisma.TransactionClient) {
     const db = tx ?? this.prisma;
-    const platformPaid = await db.booking.findMany({
+    const platformSettlements = await db.bookingSettlement.findMany({
+      where: {
+        paymentMethod: PaymentMethod.PLATFORM,
+        booking: { mechanicId, paidAt: { not: null } },
+      },
+      select: { mechanicEarningsMinor: true, bookingId: true },
+    });
+    const settledIds = new Set(platformSettlements.map((s) => s.bookingId));
+    const platformPaidUnsettled = await db.booking.findMany({
       where: {
         mechanicId,
         paymentMethod: PaymentMethod.PLATFORM,
         paidAt: { not: null },
         paidAmount: { not: null },
+        id: { notIn: [...settledIds] },
       },
       select: { paidAmount: true },
     });
@@ -499,10 +535,12 @@ export class WalletService {
       }),
     ]);
 
-    const totalEarnedMinor = platformPaid.reduce(
-      (sum, b) => sum + platformJobMechanicShareMinorFromGrossNaira(b.paidAmount),
-      0,
-    );
+    const totalEarnedMinor =
+      platformSettlements.reduce((sum, s) => sum + s.mechanicEarningsMinor, 0) +
+      platformPaidUnsettled.reduce(
+        (sum, b) => sum + platformJobMechanicShareMinorFromGrossNaira(b.paidAmount),
+        0,
+      );
     const totalPayoutMinor = payoutsSuccess.reduce((sum, t) => sum + t.amountMinor, 0);
     const pendingWithdrawalsMinor = pendingWithdrawAgg._sum.amountMinor ?? 0;
     const totalAutoFeeSettledMinor = autoFeeSettledAgg._sum.amountMinor ?? 0;
@@ -586,12 +624,21 @@ export class WalletService {
    */
   async getMechanicOwing(mechanicId: string, tx?: Prisma.TransactionClient) {
     const db = tx ?? this.prisma;
-    const directPaid = await db.booking.findMany({
+    const directSettlements = await db.bookingSettlement.findMany({
+      where: {
+        paymentMethod: PaymentMethod.DIRECT,
+        booking: { mechanicId, paidAt: { not: null } },
+      },
+      select: { platformFeeMinor: true, bookingId: true },
+    });
+    const settledIds = new Set(directSettlements.map((s) => s.bookingId));
+    const directPaidUnsettled = await db.booking.findMany({
       where: {
         mechanicId,
         paymentMethod: PaymentMethod.DIRECT,
         paidAt: { not: null },
         paidAmount: { not: null },
+        id: { notIn: [...settledIds] },
       },
       select: { paidAmount: true },
     });
@@ -612,10 +659,12 @@ export class WalletService {
       _sum: { amountMinor: true },
     });
 
-    const totalFeeOwedMinor = directPaid.reduce(
-      (sum, b) => sum + directJobPlatformFeeMinorFromGrossNaira(b.paidAmount),
-      0,
-    );
+    const totalFeeOwedMinor =
+      directSettlements.reduce((sum, s) => sum + s.platformFeeMinor, 0) +
+      directPaidUnsettled.reduce(
+        (sum, b) => sum + directJobPlatformFeeMinorFromGrossNaira(b.paidAmount),
+        0,
+      );
     const totalPaidMinor = feesPaid.reduce((sum, t) => sum + t.amountMinor, 0);
     const pendingFeeCheckoutsMinor = pendingFeesAgg._sum.amountMinor ?? 0;
     const grossUnpaidAfterSuccessPaymentsMinor = Math.max(0, totalFeeOwedMinor - totalPaidMinor);
@@ -886,7 +935,12 @@ export class WalletService {
       if (!booking.paidAt || booking.paidAmount == null) {
         throw new BadRequestException('Booking must be marked paid');
       }
-      const feeOwedMinor = directJobPlatformFeeMinorFromGrossNaira(booking.paidAmount);
+      const settlement = await this.prisma.bookingSettlement.findUnique({
+        where: { bookingId },
+      });
+      const feeOwedMinor = settlement
+        ? settlement.platformFeeMinor
+        : directJobPlatformFeeMinorFromGrossNaira(booking.paidAmount);
       const paidAgg = await this.prisma.transaction.aggregate({
         where: {
           mechanicId,
@@ -1262,28 +1316,59 @@ export class WalletService {
         }
       | undefined;
 
+    const settlement = b?.settlement;
     if (b && grossNaira != null && grossNaira > 0) {
-      const grossMinor = grossNairaToKobo(grossNaira);
-      const platformKeepsMinor = platformKeepsMinorFromGrossKobo(grossMinor);
-      const mechanicShareMinor = mechanicShareMinorFromGrossKobo(grossMinor);
-      if (b.paymentMethod === PaymentMethod.PLATFORM) {
-        feeSplit = {
-          grossNaira,
-          platformFeePercent: PLATFORM_FEE_PERCENT,
-          mechanicSharePercent: MECHANIC_SHARE_PERCENT,
-          platformKeepsNaira: platformKeepsMinor / 100,
-          mechanicShareNaira: mechanicShareMinor / 100,
-          directFeeOwedNaira: null,
-        };
-      } else if (b.paymentMethod === PaymentMethod.DIRECT) {
-        feeSplit = {
-          grossNaira,
-          platformFeePercent: PLATFORM_FEE_PERCENT,
-          mechanicSharePercent: MECHANIC_SHARE_PERCENT,
-          platformKeepsNaira: null,
-          mechanicShareNaira: grossNaira,
-          directFeeOwedNaira: platformKeepsMinor / 100,
-        };
+      if (settlement) {
+        const partsNaira = minorToNaira(settlement.partsMinor);
+        const labourNaira = minorToNaira(settlement.labourMinor);
+        if (b.paymentMethod === PaymentMethod.PLATFORM) {
+          feeSplit = {
+            grossNaira,
+            platformFeePercent: settlement.platformFeePercent,
+            mechanicSharePercent: settlement.mechanicSharePercent,
+            platformKeepsNaira: minorToNaira(settlement.platformFeeMinor),
+            mechanicShareNaira: minorToNaira(settlement.mechanicEarningsMinor),
+            directFeeOwedNaira: null,
+            partsNaira,
+            labourNaira,
+            feeAppliesTo: 'labour',
+          } as typeof feeSplit & { partsNaira: number; labourNaira: number; feeAppliesTo: string };
+        } else if (b.paymentMethod === PaymentMethod.DIRECT) {
+          feeSplit = {
+            grossNaira,
+            platformFeePercent: settlement.platformFeePercent,
+            mechanicSharePercent: settlement.mechanicSharePercent,
+            platformKeepsNaira: null,
+            mechanicShareNaira: minorToNaira(settlement.mechanicEarningsMinor),
+            directFeeOwedNaira: minorToNaira(settlement.platformFeeMinor),
+            partsNaira,
+            labourNaira,
+            feeAppliesTo: 'labour',
+          } as typeof feeSplit & { partsNaira: number; labourNaira: number; feeAppliesTo: string };
+        }
+      } else {
+        const grossMinor = grossNairaToKobo(grossNaira);
+        const platformKeepsMinor = platformKeepsMinorFromGrossKobo(grossMinor);
+        const mechanicShareMinor = mechanicShareMinorFromGrossKobo(grossMinor);
+        if (b.paymentMethod === PaymentMethod.PLATFORM) {
+          feeSplit = {
+            grossNaira,
+            platformFeePercent: PLATFORM_FEE_PERCENT,
+            mechanicSharePercent: MECHANIC_SHARE_PERCENT,
+            platformKeepsNaira: platformKeepsMinor / 100,
+            mechanicShareNaira: mechanicShareMinor / 100,
+            directFeeOwedNaira: null,
+          };
+        } else if (b.paymentMethod === PaymentMethod.DIRECT) {
+          feeSplit = {
+            grossNaira,
+            platformFeePercent: PLATFORM_FEE_PERCENT,
+            mechanicSharePercent: MECHANIC_SHARE_PERCENT,
+            platformKeepsNaira: null,
+            mechanicShareNaira: grossNaira,
+            directFeeOwedNaira: platformKeepsMinor / 100,
+          };
+        }
       }
     }
 
@@ -1316,14 +1401,31 @@ export class WalletService {
     }
 
     if (feeSplit) {
+      const extended = feeSplit as typeof feeSplit & {
+        partsNaira?: number;
+        labourNaira?: number;
+        feeAppliesTo?: string;
+      };
       lines.push({
         label: 'Job amount (customer)',
         value: `\u20A6${feeSplit.grossNaira.toLocaleString()}`,
       });
+      if (extended.partsNaira != null && extended.partsNaira > 0) {
+        lines.push({
+          label: 'Parts / materials',
+          value: `\u20A6${extended.partsNaira.toLocaleString()}`,
+        });
+      }
+      if (extended.labourNaira != null && extended.labourNaira > 0) {
+        lines.push({
+          label: 'Labour / service',
+          value: `\u20A6${extended.labourNaira.toLocaleString()}`,
+        });
+      }
       if (feeSplit.platformKeepsNaira != null) {
         lines.push({
           label: 'Platform retains',
-          value: `\u20A6${feeSplit.platformKeepsNaira.toLocaleString()} (${PLATFORM_FEE_PERCENT}%)`,
+          value: `\u20A6${feeSplit.platformKeepsNaira.toLocaleString()} (${feeSplit.platformFeePercent}% of labour)`,
         });
       }
       if (feeSplit.mechanicShareNaira != null && t.type !== TransactionType.MECHANIC_FEE) {
@@ -1334,7 +1436,7 @@ export class WalletService {
       }
       if (feeSplit.directFeeOwedNaira != null) {
         lines.push({
-          label: 'Platform fee owed on this job',
+          label: 'Platform fee owed on this job (labour only)',
           value: `\u20A6${feeSplit.directFeeOwedNaira.toLocaleString()}`,
         });
       }
@@ -1368,6 +1470,7 @@ export class WalletService {
           include: {
             vehicle: true,
             fault: true,
+            settlement: true,
             user: { select: { id: true, email: true, firstName: true, lastName: true } },
           },
         },
@@ -1386,6 +1489,7 @@ export class WalletService {
           include: {
             vehicle: true,
             fault: true,
+            settlement: true,
             mechanic: { select: { id: true, companyName: true } },
           },
         },

@@ -5,9 +5,10 @@ import { BanksController } from './banks.controller';
 import { WalletService } from './wallet.service';
 import { PaystackService } from './paystack.service';
 import { PrismaModule } from '../common/prisma/prisma.module';
+import { SettlementModule } from '../settlement/settlement.module';
 
 @Module({
-  imports: [PrismaModule],
+  imports: [PrismaModule, SettlementModule],
   controllers: [WalletController, PaystackWebhookController, BanksController],
   providers: [WalletService, PaystackService],
   exports: [WalletService, PaystackService],

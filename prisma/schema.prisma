@@ -32,6 +32,18 @@ enum QuoteStatus {
   WITHDRAWN // Mechanic withdrew their quote
 }
 
+enum InvoiceStatus {
+  DRAFT
+  SUBMITTED
+  ACCEPTED
+  SUPERSEDED
+}
+
+enum InvoiceSource {
+  MECHANIC_MANUAL
+  FROM_QUOTE
+}
+
 enum PaymentMethod {
   PLATFORM // User pays platform; we take 20%, pay mechanic 80%
   DIRECT // User pays mechanic directly; mechanic pays us 20%
@@ -188,6 +200,7 @@ model Mechanic {
   bookings        Booking[]
   receivedRatings Rating[]               @relation("MechanicRatings")
   quotes          BookingQuote[]
+  invoices        BookingInvoice[]
   clarifications  BookingClarification[]
   transactions    Transaction[]
   blockedByUsers  UserBlocksMechanic[]
@@ -302,6 +315,8 @@ model Booking {
   photoUrls         String[]             @default([])
   /** Open-board requests only: auto-expire after this time */
   openRequestExpiresAt DateTime?
+  /** Quote the user accepted (open-board flow) */
+  acceptedQuoteId      String?                @unique
 
   user           User                   @relation(fields: [userId], references: [id])
   mechanic       Mechanic?              @relation(fields: [mechanicId], references: [id])
@@ -310,9 +325,12 @@ model Booking {
   messages       Message[]
   ratings        Rating[]
   quotes         BookingQuote[]
+  invoices       BookingInvoice[]
+  settlement     BookingSettlement?
   clarifications BookingClarification[]
   transactions   Transaction[]
   reports        BookingReport[]
+  acceptedQuote  BookingQuote?          @relation("AcceptedBookingQuote", fields: [acceptedQuoteId], references: [id], onDelete: SetNull)
 }
 
 model BookingReport {
@@ -344,6 +362,11 @@ model BookingQuote {
   bookingId     String
   mechanicId    String
   proposedPrice Float
+  /** Cost breakdown in kobo (NGN minor units) */
+  partsMinor         Int?
+  labourMinor        Int?
+  otherFeesMinor     Int?
+  customerTotalMinor Int?
   message       String?
   status        QuoteStatus @default(PENDING)
   /** Number of times proposedPrice was changed after initial submit (caps revisions) */
@@ -351,10 +374,65 @@ model BookingQuote {
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
-  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  mechanic Mechanic @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+  booking              Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  mechanic             Mechanic             @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+  acceptedForBooking   Booking?             @relation("AcceptedBookingQuote")
+  invoices             BookingInvoice[]
+  settlements          BookingSettlement[]
 
   @@unique([bookingId, mechanicId])
+}
+
+model BookingInvoice {
+  id                 String        @id @default(uuid())
+  bookingId          String
+  mechanicId         String
+  version            Int           @default(1)
+  status             InvoiceStatus @default(DRAFT)
+  partsMinor         Int           @default(0)
+  labourMinor        Int           @default(0)
+  otherFeesMinor     Int           @default(0)
+  customerTotalMinor Int
+  currency           String        @default("NGN")
+  notes              String?
+  source             InvoiceSource @default(MECHANIC_MANUAL)
+  quoteId            String?
+  acceptedAt         DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  booking     Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  mechanic    Mechanic             @relation(fields: [mechanicId], references: [id], onDelete: Cascade)
+  quote       BookingQuote?        @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+  settlements BookingSettlement[]
+
+  @@index([bookingId, status])
+}
+
+model BookingSettlement {
+  id                    String        @id @default(uuid())
+  bookingId             String        @unique
+  invoiceId             String?
+  quoteId               String?
+  paymentMethod         PaymentMethod
+  sourceTransactionId   String?       @unique
+  customerTotalMinor    Int
+  partsMinor            Int           @default(0)
+  labourMinor           Int           @default(0)
+  otherFeesMinor        Int           @default(0)
+  platformFeeBaseMinor  Int
+  platformFeeMinor      Int
+  mechanicEarningsMinor Int
+  splitVersion          Int           @default(1)
+  platformFeePercent    Int           @default(20)
+  mechanicSharePercent  Int           @default(80)
+  /** True when split was inferred from legacy gross-only bookings */
+  isLegacy              Boolean       @default(false)
+  createdAt             DateTime      @default(now())
+
+  booking Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  invoice BookingInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  quote   BookingQuote?   @relation(fields: [quoteId], references: [id], onDelete: SetNull)
 }
 
 model BookingClarification {
