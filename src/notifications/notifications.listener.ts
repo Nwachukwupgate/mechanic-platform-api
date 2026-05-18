@@ -13,6 +13,117 @@ export class NotificationsListener {
     private readonly prisma: PrismaService,
   ) {}
 
+  private truncate(text: string, max = 140): string {
+    const t = text.trim();
+    if (t.length <= max) return t;
+    return `${t.slice(0, max - 1)}…`;
+  }
+
+  @OnEvent('message.created')
+  async onMessageCreated(payload: {
+    bookingId: string;
+    messageId: string;
+    receiverId: string;
+    receiverType: string;
+    senderId: string;
+    senderType: string;
+    content: string;
+  }) {
+    const preview = this.truncate(payload.content);
+    let senderLabel = 'Someone';
+    if (payload.senderType === 'MECHANIC') {
+      const mechanic = await this.prisma.mechanic.findUnique({
+        where: { id: payload.senderId },
+        select: { companyName: true, ownerFullName: true },
+      });
+      senderLabel = mechanic?.companyName || mechanic?.ownerFullName || 'Mechanic';
+    } else {
+      const user = await this.prisma.user.findUnique({
+        where: { id: payload.senderId },
+        select: { firstName: true, lastName: true },
+      });
+      senderLabel =
+        [user?.firstName, user?.lastName].filter(Boolean).join(' ').trim() || 'Customer';
+    }
+
+    const pushData = {
+      bookingId: payload.bookingId,
+      type: 'message',
+      messageId: payload.messageId,
+    };
+
+    if (payload.receiverType === 'USER') {
+      const user = await this.prisma.user.findUnique({
+        where: { id: payload.receiverId },
+        select: { expoPushToken: true },
+      });
+      if (user?.expoPushToken) {
+        await this.notifications.sendExpoPush(user.expoPushToken, {
+          title: `Message from ${senderLabel}`,
+          body: preview,
+          data: pushData,
+          channelId: 'messages',
+        });
+      }
+      await this.notifications.createInApp({
+        recipientRole: NotificationRecipientRole.USER,
+        recipientId: payload.receiverId,
+        type: 'MESSAGE',
+        title: 'New message',
+        body: `${senderLabel}: ${preview}`,
+        data: pushData,
+      });
+      return;
+    }
+
+    if (payload.receiverType === 'MECHANIC') {
+      const mechanic = await this.prisma.mechanic.findUnique({
+        where: { id: payload.receiverId },
+        select: { expoPushToken: true },
+      });
+      if (mechanic?.expoPushToken) {
+        await this.notifications.sendExpoPush(mechanic.expoPushToken, {
+          title: `Message from ${senderLabel}`,
+          body: preview,
+          data: pushData,
+          channelId: 'messages',
+        });
+      }
+      await this.notifications.createInApp({
+        recipientRole: NotificationRecipientRole.MECHANIC,
+        recipientId: payload.receiverId,
+        type: 'MESSAGE',
+        title: 'New message',
+        body: `${senderLabel}: ${preview}`,
+        data: pushData,
+      });
+    }
+  }
+
+  @OnEvent('quote.rejected')
+  async onQuoteRejected(payload: { mechanicId: string; bookingId: string; quoteId: string }) {
+    const mechanic = await this.prisma.mechanic.findUnique({
+      where: { id: payload.mechanicId },
+      select: { expoPushToken: true },
+    });
+    if (mechanic?.expoPushToken) {
+      await this.notifications.sendExpoPush(mechanic.expoPushToken, {
+        title: 'Quote declined',
+        body: 'The customer declined your quote for this job.',
+        data: { bookingId: payload.bookingId, type: 'quote_rejected' },
+        channelId: 'bookings',
+      });
+    }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.MECHANIC,
+      recipientId: payload.mechanicId,
+      type: 'QUOTE_REJECTED',
+      title: 'Quote declined',
+      body: 'The customer declined your quote.',
+      data: { bookingId: payload.bookingId },
+    });
+  }
+
   @OnEvent('quote.created')
   async onQuoteCreated(payload: { userId: string; bookingId: string; quote: any }) {
     const user = await this.prisma.user.findUnique({
@@ -33,6 +144,7 @@ export class NotificationsListener {
         title: 'New quote',
         body: `${mech} quoted on your job.`,
         data: { bookingId: payload.bookingId, type: 'quote_created' },
+        channelId: 'bookings',
       });
     }
     await this.notifications.createInApp({
@@ -69,6 +181,7 @@ export class NotificationsListener {
         title: 'Quote accepted',
         body: 'The customer accepted your quote.',
         data: { bookingId: payload.bookingId, type: 'quote_accepted' },
+        channelId: 'bookings',
       });
     }
     await this.notifications.createInApp({
@@ -129,6 +242,7 @@ export class NotificationsListener {
         title: 'Booking update',
         body: `Status: ${label}`,
         data: { bookingId: payload.bookingId, type: 'status', status: payload.status },
+        channelId: 'bookings',
       });
     }
     if (mechanic?.email) {
@@ -143,6 +257,7 @@ export class NotificationsListener {
         title: 'Booking update',
         body: `Status: ${label}`,
         data: { bookingId: payload.bookingId, type: 'status', status: payload.status },
+        channelId: 'bookings',
       });
     }
     await this.notifications.createInApp({

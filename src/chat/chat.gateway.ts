@@ -7,6 +7,7 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { OnEvent } from '@nestjs/event-emitter';
 import { Server, Socket } from 'socket.io';
 import { ChatService } from './chat.service';
@@ -30,6 +31,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private bookingsService: BookingsService,
     private jwtService: JwtService,
     private configService: ConfigService,
+    private eventEmitter: EventEmitter2,
   ) {}
 
   async handleConnection(client: Socket) {
@@ -138,6 +140,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Emit to all clients in the booking room
     this.server.to(`booking:${data.bookingId}`).emit('new_message', message);
+
+    this.eventEmitter.emit('message.created', {
+      bookingId: data.bookingId,
+      messageId: message.id,
+      receiverId: data.receiverId,
+      receiverType: data.receiverType,
+      senderId: client.data.userId,
+      senderType: client.data.userRole,
+      content: data.content,
+    });
 
     return message;
   }

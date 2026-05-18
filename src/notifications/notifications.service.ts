@@ -8,6 +8,8 @@ export type ExpoPushMessage = {
   title: string;
   body: string;
   data?: Record<string, string>;
+  /** Android notification channel (expo-notifications) */
+  channelId?: string;
 };
 
 @Injectable()
@@ -66,6 +68,7 @@ export class NotificationsService {
             body: msg.body,
             data: msg.data ?? {},
             sound: 'default',
+            ...(msg.channelId ? { channelId: msg.channelId } : {}),
           },
         ]),
       });
