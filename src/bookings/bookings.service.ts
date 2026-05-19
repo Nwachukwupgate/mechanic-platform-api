@@ -5,6 +5,7 @@ import {
   BookingStatus,
   UserRole,
   QuoteStatus,
+  QuoteType,
   InvoiceStatus,
   InvoiceSource,
 } from '@prisma/client';
@@ -18,6 +19,15 @@ import {
   resolveInvoicePricing,
   resolveQuotePricing,
 } from './booking-pricing.util';
+import {
+  MAX_CLARIFICATIONS_PER_BOOKING,
+  MAX_CLARIFICATIONS_PER_MECHANIC,
+  meetsOpenJobListingRequirements,
+  sanitizeUserForOpenBoard,
+  sanitizeMechanicForBidding,
+  validateJobDescription,
+  validateOpenJobPhotos,
+} from './job-posting.util';
 
 const OPEN_REQUEST_EXPIRY_DAYS = 7;
 /** Max times the mechanic can change the quoted price after first submit (per booking). */
@@ -55,7 +65,17 @@ export class BookingsService {
     photoUrls?: string[];
   }) {
     const { mechanicId, photoUrls, ...rest } = data;
-    const openUntil = !mechanicId
+    const isOpenBoard = !mechanicId;
+    const fault = await this.prisma.fault.findUnique({ where: { id: data.faultId } });
+    if (!fault) throw new NotFoundException('Fault not found');
+
+    validateJobDescription(data.description, isOpenBoard);
+    const photoCount = Array.isArray(photoUrls) ? photoUrls.length : 0;
+    if (isOpenBoard) {
+      validateOpenJobPhotos(photoCount, fault.name);
+    }
+
+    const openUntil = isOpenBoard
       ? new Date(Date.now() + OPEN_REQUEST_EXPIRY_DAYS * 86400000)
       : null;
     return this.prisma.booking.create({
@@ -362,9 +382,23 @@ export class BookingsService {
         q.customerTotalMinor != null ? minorToNaira(q.customerTotalMinor) : q.proposedPrice,
     });
 
+    const biddingOpen = booking.status === BookingStatus.REQUESTED;
+    const safeUser = biddingOpen && booking.user
+      ? sanitizeUserForOpenBoard(booking.user)
+      : booking.user;
+    const safeMechanic = biddingOpen && booking.mechanic
+      ? sanitizeMechanicForBidding(booking.mechanic)
+      : booking.mechanic;
+    const safeQuotes = booking.quotes?.map((q: any) => ({
+      ...mapQuote(q),
+      mechanic: q.mechanic ? sanitizeMechanicForBidding(q.mechanic) : q.mechanic,
+    }));
+
     return {
       ...booking,
-      quotes: booking.quotes?.map(mapQuote),
+      user: safeUser,
+      mechanic: safeMechanic,
+      quotes: safeQuotes ?? booking.quotes?.map(mapQuote),
       acceptedQuote: booking.acceptedQuote ? mapQuote(booking.acceptedQuote) : null,
       activeInvoice: activeInvoice
         ? {
@@ -593,11 +627,17 @@ export class BookingsService {
   async createQuote(
     bookingId: string,
     mechanicId: string,
-    input: QuotePricingInput & { message?: string },
+    input: QuotePricingInput & { message?: string; quoteType?: 'STANDARD' | 'INSPECTION' },
   ) {
-    const pricing = resolveQuotePricing(input);
+    const quoteType =
+      input.quoteType === 'INSPECTION' ? QuoteType.INSPECTION : QuoteType.STANDARD;
+    const pricing = resolveQuotePricing({ ...input, quoteType });
     const { proposedPrice, partsMinor, labourMinor, otherFeesMinor, customerTotalMinor } = pricing;
-    const message = input.message;
+    let message = input.message?.trim() || null;
+    if (quoteType === 'INSPECTION' && !message) {
+      message =
+        'Inspection visit to diagnose the issue on site. Full repair quote after physical check.';
+    }
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
       include: { fault: true, vehicle: true },
@@ -633,6 +673,7 @@ export class BookingsService {
         otherFeesMinor,
         customerTotalMinor,
         message: message ?? null,
+        quoteType,
         status: QuoteStatus.PENDING,
         priceUpdateCount: 0,
       },
@@ -643,6 +684,7 @@ export class BookingsService {
         otherFeesMinor,
         customerTotalMinor,
         message: message ?? undefined,
+        quoteType,
         status: QuoteStatus.PENDING,
         priceUpdateCount: { increment: 1 },
       },
@@ -860,6 +902,8 @@ export class BookingsService {
 
     const withDistance = openBookings
       .filter((b) => {
+        if (!meetsOpenJobListingRequirements(b)) return false;
+
         const faultCategory = b.fault.category;
         const expertiseMapped = this.mapFaultCategoryToExpertise(faultCategory);
         const expertiseList = Array.isArray(profile.expertise) ? profile.expertise : [];
@@ -905,6 +949,7 @@ export class BookingsService {
         }
         return {
           ...b,
+          user: sanitizeUserForOpenBoard(b.user),
           distanceKm: distance,
           myQuote: b.quotes[0] ?? null,
         };
@@ -913,9 +958,6 @@ export class BookingsService {
     withDistance.sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999));
     return withDistance;
   }
-
-  private static readonly MAX_CLARIFICATIONS_PER_BOOKING = 5;
-  private static readonly MAX_CLARIFICATIONS_PER_MECHANIC = 2;
 
   /** Mechanic asks a clarification question about the job (pre-quote). Helps set price; no commitment. */
   async addClarification(bookingId: string, mechanicId: string, question: string) {
@@ -936,14 +978,14 @@ export class BookingsService {
     }
     const total = booking.clarifications.length;
     const fromThisMechanic = booking.clarifications.filter((c) => c.mechanicId === mechanicId).length;
-    if (total >= BookingsService.MAX_CLARIFICATIONS_PER_BOOKING) {
+    if (total >= MAX_CLARIFICATIONS_PER_BOOKING) {
       throw new BadRequestException(
-        `This job already has the maximum of ${BookingsService.MAX_CLARIFICATIONS_PER_BOOKING} questions.`,
+        `This job already has the maximum of ${MAX_CLARIFICATIONS_PER_BOOKING} questions.`,
       );
     }
-    if (fromThisMechanic >= BookingsService.MAX_CLARIFICATIONS_PER_MECHANIC) {
+    if (fromThisMechanic >= MAX_CLARIFICATIONS_PER_MECHANIC) {
       throw new BadRequestException(
-        `You can ask up to ${BookingsService.MAX_CLARIFICATIONS_PER_MECHANIC} questions per job.`,
+        `You can ask up to ${MAX_CLARIFICATIONS_PER_MECHANIC} questions per job.`,
       );
     }
     return this.prisma.bookingClarification.create({

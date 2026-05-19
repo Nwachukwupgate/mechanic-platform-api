@@ -6,6 +6,7 @@ export type QuotePricingInput = {
   partsCost?: number;
   labourCost?: number;
   otherFees?: number;
+  quoteType?: 'STANDARD' | 'INSPECTION';
 };
 
 export type ResolvedQuotePricing = {
@@ -14,9 +15,26 @@ export type ResolvedQuotePricing = {
   labourMinor: number;
   otherFeesMinor: number;
   customerTotalMinor: number;
+  quoteType: 'STANDARD' | 'INSPECTION';
 };
 
 export function resolveQuotePricing(input: QuotePricingInput): ResolvedQuotePricing {
+  if (input.quoteType === 'INSPECTION') {
+    const fee = input.labourCost ?? input.proposedPrice ?? 0;
+    if (fee <= 0) {
+      throw new BadRequestException('Inspection / diagnosis fee must be greater than zero');
+    }
+    const totalMinor = Math.round(fee * 100);
+    return {
+      proposedPrice: fee,
+      partsMinor: 0,
+      labourMinor: totalMinor,
+      otherFeesMinor: 0,
+      customerTotalMinor: totalMinor,
+      quoteType: 'INSPECTION',
+    };
+  }
+
   const hasBreakdown =
     input.partsCost != null || input.labourCost != null || input.otherFees != null;
 
@@ -38,6 +56,7 @@ export function resolveQuotePricing(input: QuotePricingInput): ResolvedQuotePric
         labourMinor: validated.labourMinor,
         otherFeesMinor: validated.otherFeesMinor,
         customerTotalMinor: validated.customerTotalMinor,
+        quoteType: 'STANDARD',
       };
     } catch (e) {
       if (e instanceof BadRequestException) throw e;
@@ -58,6 +77,7 @@ export function resolveQuotePricing(input: QuotePricingInput): ResolvedQuotePric
     labourMinor: totalMinor,
     otherFeesMinor: 0,
     customerTotalMinor: totalMinor,
+    quoteType: 'STANDARD',
   };
 }
 

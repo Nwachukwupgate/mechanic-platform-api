@@ -167,6 +167,7 @@ export class BookingsController {
       labourCost?: number;
       otherFees?: number;
       message?: string;
+      quoteType?: 'STANDARD' | 'INSPECTION';
     },
   ) {
     return this.bookingsService.createQuote(id, mechanic.id, body);

@@ -25,6 +25,11 @@ enum BookingStatus {
   EXPIRED
 }
 
+enum QuoteType {
+  STANDARD
+  INSPECTION
+}
+
 enum QuoteStatus {
   PENDING // Mechanic submitted, waiting for user
   ACCEPTED // User chose this quote
@@ -368,6 +373,7 @@ model BookingQuote {
   otherFeesMinor     Int?
   customerTotalMinor Int?
   message       String?
+  quoteType     QuoteType   @default(STANDARD)
   status        QuoteStatus @default(PENDING)
   /** Number of times proposedPrice was changed after initial submit (caps revisions) */
   priceUpdateCount Int      @default(0)
