@@ -1,7 +1,9 @@
 import { Injectable, NotFoundException, BadRequestException, ConflictException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
-import { Prisma, UserRole, BookingStatus, TransactionType, TransactionStatus } from '@prisma/client';
+import { BookingsService } from '../bookings/bookings.service';
+import { paymentPhaseAdminLabel } from '../bookings/booking-payment.util';
+import { Prisma, UserRole, BookingStatus, TransactionType, TransactionStatus, QuoteType } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { randomBytes } from 'crypto';
 import { ADMIN_PERMISSIONS } from '../common/guards/admin-permissions';
@@ -11,6 +13,7 @@ export class AdminService {
   constructor(
     private prisma: PrismaService,
     private walletService: WalletService,
+    private bookingsService: BookingsService,
   ) {}
 
   private async logAudit(
@@ -240,30 +243,34 @@ export class AdminService {
           mechanic: { select: { id: true, companyName: true, ownerFullName: true, email: true } },
           vehicle: true,
           fault: true,
+          acceptedQuote: { select: { quoteType: true } },
         },
       }),
       this.prisma.booking.count({ where }),
     ]);
-    return { items, total, page, limit, totalPages: Math.ceil(total / limit) };
+    const itemsWithPaymentHint = items.map((b) => {
+      const isInspection = b.acceptedQuote?.quoteType === QuoteType.INSPECTION;
+      let paymentHint: string | null = null;
+      if (isInspection) {
+        if (b.paidAt) paymentHint = 'Fully paid';
+        else if (b.inspectionPaidAt) paymentHint = 'Inspection paid · balance pending';
+        else if (b.status !== 'REQUESTED') paymentHint = 'Inspection unpaid';
+        else paymentHint = 'Inspection job';
+      }
+      return { ...b, paymentHint, isInspectionFlow: isInspection };
+    });
+    return { items: itemsWithPaymentHint, total, page, limit, totalPages: Math.ceil(total / limit) };
   }
 
   async getBooking(id: string) {
-    const booking = await this.prisma.booking.findUnique({
-      where: { id },
-      include: {
-        user: { include: { profile: true } },
-        mechanic: { include: { profile: true } },
-        vehicle: true,
-        fault: true,
-        quotes: { include: { mechanic: { select: { companyName: true } } } },
-        invoices: { orderBy: { version: 'desc' } },
-        settlement: true,
-        acceptedQuote: true,
-        transactions: true,
-      },
-    });
-    if (!booking) throw new NotFoundException('Booking not found');
-    return booking;
+    const booking = await this.bookingsService.getAdminBookingDetail(id);
+    const paymentSummary = booking.paymentSummary;
+    return {
+      ...booking,
+      paymentPhaseLabel: paymentSummary
+        ? paymentPhaseAdminLabel(paymentSummary.phase)
+        : null,
+    };
   }
 
   async setBookingDispute(id: string, body: { disputeReason?: string; resolve?: boolean }, adminId: string) {
@@ -315,7 +322,7 @@ export class AdminService {
       priorStatus: booking.status,
       nextStatus: status,
     });
-    return row;
+    return this.getBooking(id);
   }
 
   async listTransactions(params: {

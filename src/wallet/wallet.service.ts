@@ -16,6 +16,7 @@ import {
   TransactionStatus,
   PaymentMethod,
   BookingStatus,
+  SettlementPhase,
 } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -28,8 +29,19 @@ import {
   directJobPlatformFeeMinorFromGrossNaira,
   platformJobMechanicShareMinorFromGrossNaira,
 } from './mechanic-wallet-amounts';
-import { SettlementService } from '../settlement/settlement.service';
+import {
+  computeBookingPaymentSummary,
+  paymentAmountMinorForPhase,
+  settlementPhaseForPayment,
+  validateRepairInvoiceTotal,
+} from '../bookings/booking-payment.util';
 import { minorToNaira } from '../settlement/settlement-amounts';
+import { SettlementService } from '../settlement/settlement.service';
+import {
+  applyBookingPaymentSuccess,
+  assertBookingPayableStatus,
+  buildBookingPaymentContext,
+} from './booking-payment-apply.util';
 
 @Injectable()
 export class WalletService {
@@ -48,21 +60,29 @@ export class WalletService {
   async initializePayment(userId: string, bookingId: string) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { user: true, mechanic: true },
+      include: {
+        user: true,
+        mechanic: true,
+        acceptedQuote: true,
+        invoices: { orderBy: { version: 'desc' } },
+      },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.userId !== userId) throw new ForbiddenException('Not your booking');
-    const allowedStatuses: BookingStatus[] = [BookingStatus.ACCEPTED, BookingStatus.IN_PROGRESS, BookingStatus.DONE];
-    if (!allowedStatuses.includes(booking.status)) {
-      throw new BadRequestException('Booking must be accepted (or in progress / done) before payment');
+    assertBookingPayableStatus(booking.status);
+
+    const ctx = buildBookingPaymentContext(booking);
+    if (ctx.settlementPhase === SettlementPhase.REPAIR && !booking.inspectionPaidAt) {
+      throw new BadRequestException('Pay the inspection fee before paying the repair balance');
     }
-    if (booking.paidAt) throw new BadRequestException('Booking already paid');
-    if (booking.estimatedCost == null || booking.estimatedCost <= 0) {
-      throw new BadRequestException('Booking has no agreed cost');
+    if (booking.paidAt && ctx.summary.phase !== 'inspection') {
+      throw new BadRequestException('Booking already paid');
+    }
+    if (booking.inspectionPaidAt && ctx.summary.phase === 'inspection') {
+      throw new BadRequestException('Inspection fee already paid');
     }
 
-    const amountNaira = Math.ceil(booking.estimatedCost);
-    const amountKobo = amountNaira * 100;
+    const amountKobo = ctx.amountMinor;
     const reference = `bk_${bookingId}_${randomBytes(8).toString('hex')}`;
     const frontendUrl = this.configService.get<string>('FRONTEND_URL') || '';
     // Paystack redirects here after payment with &reference= &trxref= appended. Include bookingId so the SPA can return to the booking.
@@ -90,8 +110,17 @@ export class WalletService {
         userId,
         mechanicId: booking.mechanicId ?? undefined,
         bookingId,
-        description: `Payment for booking ${bookingId}`,
-        metadata: { authorization_url: result.authorization_url },
+        description:
+          ctx.settlementPhase === SettlementPhase.INSPECTION
+            ? `Inspection fee for booking ${bookingId}`
+            : ctx.settlementPhase === SettlementPhase.REPAIR
+              ? `Repair balance for booking ${bookingId}`
+              : `Payment for booking ${bookingId}`,
+        metadata: {
+          authorization_url: result.authorization_url,
+          settlementPhase: ctx.settlementPhase,
+          paymentPhase: ctx.summary.phase,
+        },
       },
     });
 
@@ -209,17 +238,17 @@ export class WalletService {
       return false;
     }
 
+    const paymentTxRow = await txClient.transaction.findUnique({
+      where: { id: paymentTx.id },
+      select: { metadata: true },
+    });
+    const meta = (paymentTxRow?.metadata as { settlementPhase?: SettlementPhase } | null) ?? null;
+
     const booking = await txClient.booking.findUnique({
       where: { id: paymentTx.bookingId },
-      select: {
-        id: true,
-        userId: true,
-        mechanicId: true,
-        paidAt: true,
-        paymentMethod: true,
-        paidAmount: true,
-        paystackReference: true,
-        status: true,
+      include: {
+        acceptedQuote: true,
+        invoices: { orderBy: { version: 'desc' } },
       },
     });
     if (!booking) {
@@ -227,52 +256,61 @@ export class WalletService {
       return false;
     }
 
-    if (booking.paymentMethod && booking.paymentMethod !== PaymentMethod.PLATFORM) {
+    const phase = meta?.settlementPhase ?? SettlementPhase.FULL;
+    if (phase === SettlementPhase.INSPECTION) {
+      if (booking.inspectionPaidAt) return false;
+    } else if (phase === SettlementPhase.REPAIR) {
+      if (booking.paidAt) return false;
+    } else if (booking.paidAt && booking.paymentMethod === PaymentMethod.PLATFORM) {
+      return false;
+    }
+
+    if (
+      booking.paymentMethod &&
+      booking.paymentMethod !== PaymentMethod.PLATFORM &&
+      phase !== SettlementPhase.INSPECTION
+    ) {
       this.logger.error(
         `reconcile USER_PAYMENT skipped: booking=${booking.id} has paymentMethod=${booking.paymentMethod}`,
       );
       return false;
     }
-
-    const alreadyConsistent =
-      booking.paidAt != null &&
-      booking.paymentMethod === PaymentMethod.PLATFORM &&
-      booking.paidAmount != null &&
-      booking.status === BookingStatus.PAID;
-    if (alreadyConsistent) {
+    if (
+      phase === SettlementPhase.INSPECTION &&
+      booking.inspectionPaymentMethod &&
+      booking.inspectionPaymentMethod !== PaymentMethod.PLATFORM
+    ) {
       return false;
     }
 
-    const paidAmountNaira =
-      booking.paidAmount != null && booking.paidAmount > 0
-        ? booking.paidAmount
-        : paymentTx.amountMinor / 100;
+    const ctx = buildBookingPaymentContext(booking);
+    if (meta?.settlementPhase && meta.settlementPhase !== ctx.settlementPhase) {
+      this.logger.warn(
+        `reconcile USER_PAYMENT skipped: phase mismatch booking=${booking.id} tx=${phase} current=${ctx.settlementPhase}`,
+      );
+      return false;
+    }
 
-    await txClient.booking.update({
-      where: { id: booking.id },
-      data: {
-        paidAt: booking.paidAt ?? new Date(),
-        paymentMethod: PaymentMethod.PLATFORM,
-        paidAmount: paidAmountNaira,
-        paystackReference: booking.paystackReference ?? paymentTx.paystackReference ?? undefined,
-        status: BookingStatus.PAID,
-      },
-    });
-
-    await this.settlementService.createSettlementForPaidBooking(
-      booking.id,
+    await applyBookingPaymentSuccess(
+      booking,
+      ctx,
       PaymentMethod.PLATFORM,
+      paymentTx.paystackReference,
+      txClient as Prisma.TransactionClient,
+      this.settlementService,
       paymentTx.id,
-      txClient,
     );
 
     this.eventEmitter.emit('booking.statusChanged', {
       bookingId: booking.id,
-      status: BookingStatus.PAID,
+      status:
+        phase === SettlementPhase.REPAIR || phase === SettlementPhase.FULL
+          ? BookingStatus.PAID
+          : booking.status,
       userId: booking.userId,
       mechanicId: booking.mechanicId,
     });
-    this.logger.warn(`reconcile USER_PAYMENT applied bookingId=${booking.id} tx=${paymentTx.id}`);
+    this.logger.warn(`reconcile USER_PAYMENT applied bookingId=${booking.id} tx=${paymentTx.id} phase=${phase}`);
     return true;
   }
 
@@ -319,7 +357,6 @@ export class WalletService {
       return { applied: false, reason: 'verify_failed' };
     }
 
-    const amountNaira = verify.amount / 100;
     const bookingId = pending.bookingId;
     const pendingId = pending.id;
 
@@ -332,21 +369,24 @@ export class WalletService {
         if (updated.count === 0) {
           return;
         }
-        await tx.booking.update({
+        const booking = await tx.booking.findUnique({
           where: { id: bookingId },
-          data: {
-            paidAt: new Date(),
-            paymentMethod: PaymentMethod.PLATFORM,
-            paidAmount: amountNaira,
-            paystackReference: paystackRef,
-            status: BookingStatus.PAID,
-          },
+          include: { acceptedQuote: true, invoices: { orderBy: { version: 'desc' } } },
         });
-        await this.settlementService.createSettlementForPaidBooking(
-          bookingId,
+        if (!booking) return;
+        const ctx = buildBookingPaymentContext(booking);
+        const meta = pending.metadata as { settlementPhase?: SettlementPhase } | null;
+        if (meta?.settlementPhase && meta.settlementPhase !== ctx.settlementPhase) {
+          throw new BadRequestException('Payment session no longer matches booking state');
+        }
+        await applyBookingPaymentSuccess(
+          booking,
+          ctx,
           PaymentMethod.PLATFORM,
-          pendingId,
+          paystackRef,
           tx,
+          this.settlementService,
+          pendingId,
         );
       });
     } catch (e) {
@@ -361,19 +401,13 @@ export class WalletService {
       return { applied: false, duplicate: true };
     }
 
-    await this.settlementService.createSettlementForPaidBooking(
-      bookingId,
-      PaymentMethod.PLATFORM,
-      confirmed.id,
-    );
-
-    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
-    if (booking) {
+    const bookingAfter = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (bookingAfter) {
       this.eventEmitter.emit('booking.statusChanged', {
-        bookingId: booking.id,
-        status: BookingStatus.PAID,
-        userId: booking.userId,
-        mechanicId: booking.mechanicId,
+        bookingId: bookingAfter.id,
+        status: bookingAfter.status,
+        userId: bookingAfter.userId,
+        mechanicId: bookingAfter.mechanicId,
       });
     }
     this.logger.log(`USER_PAYMENT finalized ref=${paystackRef} bookingId=${bookingId}`);
@@ -384,34 +418,40 @@ export class WalletService {
   async markDirectPaid(userId: string, bookingId: string) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
+      include: { acceptedQuote: true, invoices: { orderBy: { version: 'desc' } } },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.userId !== userId) throw new ForbiddenException('Not your booking');
-    if (booking.paidAt) throw new BadRequestException('Booking already marked as paid');
-    const amount = booking.estimatedCost ?? booking.actualCost ?? 0;
-    if (amount <= 0) throw new BadRequestException('Booking has no cost');
+    assertBookingPayableStatus(booking.status);
 
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
-      data: {
-        paidAt: new Date(),
-        paymentMethod: PaymentMethod.DIRECT,
-        paidAmount: amount,
-        status: BookingStatus.PAID,
-      },
+    const ctx = buildBookingPaymentContext(booking);
+    if (booking.paidAt && ctx.summary.phase !== 'inspection') {
+      throw new BadRequestException('Booking already marked as paid');
+    }
+    if (booking.inspectionPaidAt && ctx.summary.phase === 'inspection') {
+      throw new BadRequestException('Inspection fee already paid');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await applyBookingPaymentSuccess(
+        booking,
+        ctx,
+        PaymentMethod.DIRECT,
+        null,
+        tx,
+        this.settlementService,
+      );
     });
 
-    await this.settlementService.createSettlementForPaidBooking(
-      bookingId,
-      PaymentMethod.DIRECT,
-    );
-
-    this.eventEmitter.emit('booking.statusChanged', {
-      bookingId: updated.id,
-      status: BookingStatus.PAID,
-      userId: updated.userId,
-      mechanicId: updated.mechanicId,
-    });
+    const updated = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (updated) {
+      this.eventEmitter.emit('booking.statusChanged', {
+        bookingId: updated.id,
+        status: updated.status,
+        userId: updated.userId,
+        mechanicId: updated.mechanicId,
+      });
+    }
 
     return this.prisma.booking.findUnique({
       where: { id: bookingId },
@@ -473,7 +513,7 @@ export class WalletService {
     const platformSettlements = await db.bookingSettlement.findMany({
       where: {
         paymentMethod: PaymentMethod.PLATFORM,
-        booking: { mechanicId, paidAt: { not: null } },
+        booking: { mechanicId },
       },
       select: { mechanicEarningsMinor: true, bookingId: true },
     });
@@ -929,18 +969,22 @@ export class WalletService {
         where: { id: bookingId, mechanicId },
       });
       if (!booking) throw new NotFoundException('Booking not found');
-      if (booking.paymentMethod !== PaymentMethod.DIRECT) {
+      const hasDirectRepairPay =
+        booking.paymentMethod === PaymentMethod.DIRECT && booking.paidAt != null;
+      const hasDirectInspectionPay =
+        booking.inspectionPaymentMethod === PaymentMethod.DIRECT &&
+        booking.inspectionPaidAt != null;
+      if (!hasDirectRepairPay && !hasDirectInspectionPay) {
         throw new BadRequestException('Fee payments can only be allocated to direct-paid bookings');
       }
-      if (!booking.paidAt || booking.paidAmount == null) {
-        throw new BadRequestException('Booking must be marked paid');
-      }
-      const settlement = await this.prisma.bookingSettlement.findUnique({
-        where: { bookingId },
+      const settlements = await this.prisma.bookingSettlement.findMany({
+        where: { bookingId, paymentMethod: PaymentMethod.DIRECT },
       });
-      const feeOwedMinor = settlement
-        ? settlement.platformFeeMinor
-        : directJobPlatformFeeMinorFromGrossNaira(booking.paidAmount);
+      const feeOwedMinor = settlements.length
+        ? settlements.reduce((sum, s) => sum + s.platformFeeMinor, 0)
+        : hasDirectInspectionPay && !hasDirectRepairPay
+          ? directJobPlatformFeeMinorFromGrossNaira(booking.inspectionPaidAmount)
+          : directJobPlatformFeeMinorFromGrossNaira(booking.paidAmount);
       const paidAgg = await this.prisma.transaction.aggregate({
         where: {
           mechanicId,
@@ -1304,7 +1348,26 @@ export class WalletService {
 
   private enrichTransactionForDetail(t: any) {
     const b = t.booking;
-    const grossNaira = b?.paidAmount != null ? Number(b.paidAmount) : null;
+    const meta = (t.metadata as Record<string, unknown> | null) || {};
+    const phase =
+      typeof meta.settlementPhase === 'string' ? meta.settlementPhase : undefined;
+    const settlements: any[] = b?.settlements ?? [];
+    const settlement =
+      (phase ? settlements.find((s) => s.phase === phase) : undefined) ??
+      (settlements.length === 1 ? settlements[0] : settlements[settlements.length - 1]);
+
+    const grossNaira =
+      t.type === TransactionType.USER_PAYMENT && t.amountMinor > 0
+        ? t.amountMinor / 100
+        : b?.paidAmount != null
+          ? Number(b.paidAmount)
+          : null;
+
+    const paymentMethodForSplit =
+      phase === 'INSPECTION'
+        ? b?.inspectionPaymentMethod ?? b?.paymentMethod
+        : b?.paymentMethod;
+
     let feeSplit:
       | {
           grossNaira: number;
@@ -1316,12 +1379,11 @@ export class WalletService {
         }
       | undefined;
 
-    const settlement = b?.settlement;
     if (b && grossNaira != null && grossNaira > 0) {
       if (settlement) {
         const partsNaira = minorToNaira(settlement.partsMinor);
         const labourNaira = minorToNaira(settlement.labourMinor);
-        if (b.paymentMethod === PaymentMethod.PLATFORM) {
+        if (paymentMethodForSplit === PaymentMethod.PLATFORM) {
           feeSplit = {
             grossNaira,
             platformFeePercent: settlement.platformFeePercent,
@@ -1333,7 +1395,7 @@ export class WalletService {
             labourNaira,
             feeAppliesTo: 'labour',
           } as typeof feeSplit & { partsNaira: number; labourNaira: number; feeAppliesTo: string };
-        } else if (b.paymentMethod === PaymentMethod.DIRECT) {
+        } else if (paymentMethodForSplit === PaymentMethod.DIRECT) {
           feeSplit = {
             grossNaira,
             platformFeePercent: settlement.platformFeePercent,
@@ -1350,7 +1412,7 @@ export class WalletService {
         const grossMinor = grossNairaToKobo(grossNaira);
         const platformKeepsMinor = platformKeepsMinorFromGrossKobo(grossMinor);
         const mechanicShareMinor = mechanicShareMinorFromGrossKobo(grossMinor);
-        if (b.paymentMethod === PaymentMethod.PLATFORM) {
+        if (paymentMethodForSplit === PaymentMethod.PLATFORM) {
           feeSplit = {
             grossNaira,
             platformFeePercent: PLATFORM_FEE_PERCENT,
@@ -1359,7 +1421,7 @@ export class WalletService {
             mechanicShareNaira: mechanicShareMinor / 100,
             directFeeOwedNaira: null,
           };
-        } else if (b.paymentMethod === PaymentMethod.DIRECT) {
+        } else if (paymentMethodForSplit === PaymentMethod.DIRECT) {
           feeSplit = {
             grossNaira,
             platformFeePercent: PLATFORM_FEE_PERCENT,
@@ -1373,16 +1435,16 @@ export class WalletService {
     }
 
     const lines: { label: string; value: string }[] = [];
-    const meta = (t.metadata as Record<string, unknown> | null) || {};
+    const lineMeta = (t.metadata as Record<string, unknown> | null) || {};
     if (t.type === TransactionType.PLATFORM_PAYOUT) {
       lines.push({ label: 'Type', value: 'Withdrawal / payout to your bank' });
-      if (typeof meta.transferCode === 'string' && meta.transferCode.trim()) {
-        lines.push({ label: 'Paystack transfer', value: meta.transferCode.trim() });
+      if (typeof lineMeta.transferCode === 'string' && lineMeta.transferCode.trim()) {
+        lines.push({ label: 'Paystack transfer', value: lineMeta.transferCode.trim() });
       }
-      if (typeof meta.feeChargedMinor === 'number' && meta.feeChargedMinor > 0) {
+      if (typeof lineMeta.feeChargedMinor === 'number' && lineMeta.feeChargedMinor > 0) {
         lines.push({
           label: 'Paystack transfer fee',
-          value: `\u20A6${(meta.feeChargedMinor / 100).toLocaleString()} (charged to platform)`,
+          value: `\u20A6${(lineMeta.feeChargedMinor / 100).toLocaleString()} (charged to platform)`,
         });
       }
     } else if (t.type === TransactionType.MECHANIC_FEE) {
@@ -1470,7 +1532,7 @@ export class WalletService {
           include: {
             vehicle: true,
             fault: true,
-            settlement: true,
+            settlements: { orderBy: { createdAt: 'asc' } },
             user: { select: { id: true, email: true, firstName: true, lastName: true } },
           },
         },
@@ -1489,7 +1551,7 @@ export class WalletService {
           include: {
             vehicle: true,
             fault: true,
-            settlement: true,
+            settlements: { orderBy: { createdAt: 'asc' } },
             mechanic: { select: { id: true, companyName: true } },
           },
         },

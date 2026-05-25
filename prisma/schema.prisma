@@ -49,6 +49,12 @@ enum InvoiceSource {
   FROM_QUOTE
 }
 
+enum SettlementPhase {
+  INSPECTION
+  REPAIR
+  FULL
+}
+
 enum PaymentMethod {
   PLATFORM // User pays platform; we take 20%, pay mechanic 80%
   DIRECT // User pays mechanic directly; mechanic pays us 20%
@@ -312,8 +318,13 @@ model Booking {
   paidAt            DateTime?
   deliveredAt       DateTime?
   paymentMethod     PaymentMethod?
-  paidAmount        Float? // Amount actually paid (for platform: from Paystack; for direct: agreed amount)
+  paidAmount        Float? // Cumulative when fully paid (inspection + repair balance for inspection jobs)
   paystackReference String? // Paystack reference when user pays via platform
+  /** Inspection visit fee paid before full repair invoice (inspection quote flow only). */
+  inspectionPaidAt            DateTime?
+  inspectionPaidAmount        Float?
+  inspectionPaymentMethod     PaymentMethod?
+  inspectionPaystackReference String?
   disputeReason     String? // Set when user/mechanic raises a dispute
   disputeResolvedAt DateTime? // When admin resolved it
   resolvedById      String? // Admin user id who resolved
@@ -331,7 +342,7 @@ model Booking {
   ratings        Rating[]
   quotes         BookingQuote[]
   invoices       BookingInvoice[]
-  settlement     BookingSettlement?
+  settlements    BookingSettlement[]
   clarifications BookingClarification[]
   transactions   Transaction[]
   reports        BookingReport[]
@@ -416,29 +427,33 @@ model BookingInvoice {
 }
 
 model BookingSettlement {
-  id                    String        @id @default(uuid())
-  bookingId             String        @unique
+  id                    String          @id @default(uuid())
+  bookingId             String
+  phase                 SettlementPhase @default(FULL)
   invoiceId             String?
   quoteId               String?
   paymentMethod         PaymentMethod
-  sourceTransactionId   String?       @unique
+  sourceTransactionId   String?         @unique
   customerTotalMinor    Int
-  partsMinor            Int           @default(0)
-  labourMinor           Int           @default(0)
-  otherFeesMinor        Int           @default(0)
+  partsMinor            Int             @default(0)
+  labourMinor           Int             @default(0)
+  otherFeesMinor        Int             @default(0)
   platformFeeBaseMinor  Int
   platformFeeMinor      Int
   mechanicEarningsMinor Int
-  splitVersion          Int           @default(1)
-  platformFeePercent    Int           @default(20)
-  mechanicSharePercent  Int           @default(80)
+  splitVersion          Int             @default(1)
+  platformFeePercent    Int             @default(20)
+  mechanicSharePercent  Int             @default(80)
   /** True when split was inferred from legacy gross-only bookings */
-  isLegacy              Boolean       @default(false)
-  createdAt             DateTime      @default(now())
+  isLegacy              Boolean         @default(false)
+  createdAt             DateTime        @default(now())
 
   booking Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   invoice BookingInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
   quote   BookingQuote?   @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+
+  @@unique([bookingId, phase])
+  @@index([bookingId])
 }
 
 model BookingClarification {

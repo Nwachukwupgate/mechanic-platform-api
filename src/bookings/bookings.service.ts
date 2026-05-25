@@ -23,11 +23,15 @@ import {
   MAX_CLARIFICATIONS_PER_BOOKING,
   MAX_CLARIFICATIONS_PER_MECHANIC,
   meetsOpenJobListingRequirements,
-  sanitizeUserForOpenBoard,
-  sanitizeMechanicForBidding,
-  validateJobDescription,
   validateOpenJobPhotos,
 } from './job-posting.util';
+import {
+  computeBookingPaymentSummary,
+  findRepairInvoice,
+  isInspectionFlow,
+  validateRepairInvoiceTotal,
+} from './booking-payment.util';
+import { nairaToMinor } from '../settlement/settlement-amounts';
 
 const OPEN_REQUEST_EXPIRY_DAYS = 7;
 /** Max times the mechanic can change the quoted price after first submit (per booking). */
@@ -69,7 +73,6 @@ export class BookingsService {
     const fault = await this.prisma.fault.findUnique({ where: { id: data.faultId } });
     if (!fault) throw new NotFoundException('Fault not found');
 
-    validateJobDescription(data.description, isOpenBoard);
     const photoCount = Array.isArray(photoUrls) ? photoUrls.length : 0;
     if (isOpenBoard) {
       validateOpenJobPhotos(photoCount, fault.name);
@@ -312,7 +315,7 @@ export class BookingsService {
         },
         ratings: { take: 1, select: { id: true, rating: true } },
         invoices: { orderBy: { version: 'desc' } },
-        settlement: true,
+        settlements: { orderBy: { createdAt: 'asc' } },
         acceptedQuote: true,
       },
     });
@@ -332,10 +335,60 @@ export class BookingsService {
     return enriched;
   }
 
+  /** Admin booking detail: full relations + payment phase, settlements, invoices. */
+  async getAdminBookingDetail(bookingId: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: {
+        user: { include: { profile: true } },
+        mechanic: { include: { profile: true } },
+        vehicle: true,
+        fault: true,
+        quotes: {
+          include: { mechanic: { select: { id: true, companyName: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+        invoices: { orderBy: { version: 'desc' } },
+        settlements: { orderBy: { createdAt: 'asc' } },
+        acceptedQuote: true,
+        transactions: { orderBy: { createdAt: 'desc' } },
+      },
+    });
+    if (!booking) {
+      throw new NotFoundException('Booking not found');
+    }
+    const enriched = await this.attachPricingToBooking(booking);
+    const mapInvoice = (inv: {
+      partsMinor: number;
+      labourMinor: number;
+      otherFeesMinor: number;
+      customerTotalMinor: number;
+      [key: string]: unknown;
+    }) => ({
+      ...inv,
+      partsNaira: minorToNaira(inv.partsMinor),
+      labourNaira: minorToNaira(inv.labourMinor),
+      otherFeesNaira: minorToNaira(inv.otherFeesMinor),
+      customerTotalNaira: minorToNaira(inv.customerTotalMinor),
+    });
+    return {
+      ...enriched,
+      invoices: booking.invoices?.map(mapInvoice) ?? [],
+    };
+  }
+
   private async attachPricingToBooking(booking: any) {
+    const repairInvoice =
+      findRepairInvoice(booking.invoices, InvoiceStatus.ACCEPTED) ??
+      findRepairInvoice(booking.invoices, InvoiceStatus.SUBMITTED) ??
+      findRepairInvoice(booking.invoices, InvoiceStatus.DRAFT);
+
     const activeInvoice =
-      booking.invoices?.find((i: { status: string }) => i.status === InvoiceStatus.ACCEPTED) ??
-      booking.invoices?.find((i: { status: string }) => i.status === InvoiceStatus.SUBMITTED) ??
+      repairInvoice ??
+      booking.invoices?.find(
+        (i: { status: string; source: string }) =>
+          i.status === InvoiceStatus.ACCEPTED && i.source === InvoiceSource.FROM_QUOTE,
+      ) ??
       booking.invoices?.[0];
 
     let breakdown: {
@@ -369,9 +422,20 @@ export class BookingsService {
       };
     }
 
-    const pricingSummary = booking.settlement
-      ? settlementToPricingSummary(booking.settlement)
+    const pricingSummary = booking.settlements?.length
+      ? settlementToPricingSummary(
+          booking.settlements[booking.settlements.length - 1],
+        )
       : buildPricingSummary(breakdown);
+
+    const paymentSummary = computeBookingPaymentSummary({
+      acceptedQuote: booking.acceptedQuote,
+      inspectionPaidAt: booking.inspectionPaidAt,
+      inspectionPaidAmount: booking.inspectionPaidAmount,
+      paidAt: booking.paidAt,
+      estimatedCost: booking.estimatedCost,
+      invoices: booking.invoices,
+    });
 
     const mapQuote = (q: any) => ({
       ...q,
@@ -382,23 +446,9 @@ export class BookingsService {
         q.customerTotalMinor != null ? minorToNaira(q.customerTotalMinor) : q.proposedPrice,
     });
 
-    const biddingOpen = booking.status === BookingStatus.REQUESTED;
-    const safeUser = biddingOpen && booking.user
-      ? sanitizeUserForOpenBoard(booking.user)
-      : booking.user;
-    const safeMechanic = biddingOpen && booking.mechanic
-      ? sanitizeMechanicForBidding(booking.mechanic)
-      : booking.mechanic;
-    const safeQuotes = booking.quotes?.map((q: any) => ({
-      ...mapQuote(q),
-      mechanic: q.mechanic ? sanitizeMechanicForBidding(q.mechanic) : q.mechanic,
-    }));
-
     return {
       ...booking,
-      user: safeUser,
-      mechanic: safeMechanic,
-      quotes: safeQuotes ?? booking.quotes?.map(mapQuote),
+      quotes: booking.quotes?.map(mapQuote) ?? booking.quotes,
       acceptedQuote: booking.acceptedQuote ? mapQuote(booking.acceptedQuote) : null,
       activeInvoice: activeInvoice
         ? {
@@ -410,15 +460,33 @@ export class BookingsService {
           }
         : null,
       pricingSummary,
-      settlement: booking.settlement
+      paymentSummary,
+      settlements: booking.settlements?.map((s: any) => ({
+        ...s,
+        customerTotalNaira: minorToNaira(s.customerTotalMinor),
+        partsNaira: minorToNaira(s.partsMinor),
+        labourNaira: minorToNaira(s.labourMinor),
+        otherFeesNaira: minorToNaira(s.otherFeesMinor),
+        platformFeeNaira: minorToNaira(s.platformFeeMinor),
+        mechanicEarningsNaira: minorToNaira(s.mechanicEarningsMinor),
+      })) ?? [],
+      settlement: booking.settlements?.length
         ? {
-            ...booking.settlement,
-            customerTotalNaira: minorToNaira(booking.settlement.customerTotalMinor),
-            partsNaira: minorToNaira(booking.settlement.partsMinor),
-            labourNaira: minorToNaira(booking.settlement.labourMinor),
-            otherFeesNaira: minorToNaira(booking.settlement.otherFeesMinor),
-            platformFeeNaira: minorToNaira(booking.settlement.platformFeeMinor),
-            mechanicEarningsNaira: minorToNaira(booking.settlement.mechanicEarningsMinor),
+            ...booking.settlements[booking.settlements.length - 1],
+            customerTotalNaira: minorToNaira(
+              booking.settlements[booking.settlements.length - 1].customerTotalMinor,
+            ),
+            partsNaira: minorToNaira(booking.settlements[booking.settlements.length - 1].partsMinor),
+            labourNaira: minorToNaira(booking.settlements[booking.settlements.length - 1].labourMinor),
+            otherFeesNaira: minorToNaira(
+              booking.settlements[booking.settlements.length - 1].otherFeesMinor,
+            ),
+            platformFeeNaira: minorToNaira(
+              booking.settlements[booking.settlements.length - 1].platformFeeMinor,
+            ),
+            mechanicEarningsNaira: minorToNaira(
+              booking.settlements[booking.settlements.length - 1].mechanicEarningsMinor,
+            ),
           }
         : null,
     };
@@ -450,6 +518,17 @@ export class BookingsService {
     }
     if (role === UserRole.USER && booking.userId !== userId) {
       throw new NotFoundException('Booking not found');
+    }
+
+    if (
+      status === BookingStatus.IN_PROGRESS &&
+      role === UserRole.MECHANIC &&
+      isInspectionFlow(booking) &&
+      !booking.inspectionPaidAt
+    ) {
+      throw new BadRequestException(
+        'Customer must pay the inspection fee before you can start work',
+      );
     }
 
     const updateData: any = { status };
@@ -496,7 +575,10 @@ export class BookingsService {
 
   /** Mechanic: structured job costing (parts / labour / other). */
   async upsertInvoice(bookingId: string, mechanicId: string, input: InvoicePricingInput) {
-    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { acceptedQuote: true },
+    });
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.mechanicId !== mechanicId) {
       throw new NotFoundException('Booking not found');
@@ -509,8 +591,26 @@ export class BookingsService {
     if (closedStatuses.includes(booking.status)) {
       throw new BadRequestException('Cannot update costing on a closed booking');
     }
+    const inspectionJob = isInspectionFlow(booking);
+    if (inspectionJob && !booking.inspectionPaidAt) {
+      throw new BadRequestException(
+        'Inspection fee must be paid before submitting a repair quote',
+      );
+    }
 
     const pricing = resolveInvoicePricing(input);
+    if (inspectionJob && booking.inspectionPaidAmount != null) {
+      try {
+        validateRepairInvoiceTotal(
+          pricing.customerTotalMinor,
+          nairaToMinor(booking.inspectionPaidAmount),
+        );
+      } catch {
+        throw new BadRequestException(
+          'Repair total must be at least the inspection fee already paid',
+        );
+      }
+    }
     const existingDraft = await this.prisma.bookingInvoice.findFirst({
       where: { bookingId, mechanicId, status: InvoiceStatus.DRAFT },
       orderBy: { version: 'desc' },
@@ -549,23 +649,44 @@ export class BookingsService {
       });
     }
 
-    await this.prisma.booking.update({
-      where: { id: bookingId },
-      data: {
-        estimatedCost: pricing.customerTotalNaira,
-        actualCost: pricing.customerTotalNaira,
-      },
-    });
+    if (!inspectionJob) {
+      await this.prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          estimatedCost: pricing.customerTotalNaira,
+          actualCost: pricing.customerTotalNaira,
+        },
+      });
+    }
 
     return this.findById(bookingId);
   }
 
   async submitInvoice(bookingId: string, mechanicId: string) {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { acceptedQuote: true },
+    });
+    if (!booking || booking.mechanicId !== mechanicId) {
+      throw new NotFoundException('Booking not found');
+    }
     const invoice = await this.prisma.bookingInvoice.findFirst({
       where: { bookingId, mechanicId, status: InvoiceStatus.DRAFT },
       orderBy: { version: 'desc' },
     });
     if (!invoice) throw new BadRequestException('No draft invoice to submit');
+    if (isInspectionFlow(booking) && booking.inspectionPaidAmount != null) {
+      try {
+        validateRepairInvoiceTotal(
+          invoice.customerTotalMinor,
+          nairaToMinor(booking.inspectionPaidAmount),
+        );
+      } catch {
+        throw new BadRequestException(
+          'Repair total must be at least the inspection fee already paid',
+        );
+      }
+    }
     await this.prisma.bookingInvoice.update({
       where: { id: invoice.id },
       data: { status: InvoiceStatus.SUBMITTED },
@@ -574,17 +695,34 @@ export class BookingsService {
   }
 
   async acceptInvoice(bookingId: string, userId: string) {
-    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { acceptedQuote: true },
+    });
     if (!booking || booking.userId !== userId) throw new NotFoundException('Booking not found');
 
     const invoice = await this.prisma.bookingInvoice.findFirst({
       where: {
         bookingId,
-        status: { in: [InvoiceStatus.SUBMITTED, InvoiceStatus.DRAFT] },
+        status: InvoiceStatus.SUBMITTED,
+        source: InvoiceSource.MECHANIC_MANUAL,
       },
       orderBy: { version: 'desc' },
     });
-    if (!invoice) throw new BadRequestException('No invoice awaiting acceptance');
+    if (!invoice) throw new BadRequestException('No repair invoice awaiting acceptance');
+
+    if (isInspectionFlow(booking) && booking.inspectionPaidAmount != null) {
+      try {
+        validateRepairInvoiceTotal(
+          invoice.customerTotalMinor,
+          nairaToMinor(booking.inspectionPaidAmount),
+        );
+      } catch {
+        throw new BadRequestException(
+          'Repair total must be at least the inspection fee already paid',
+        );
+      }
+    }
 
     await this.prisma.$transaction([
       this.prisma.bookingInvoice.updateMany({
@@ -806,6 +944,7 @@ export class BookingsService {
     const otherFeesMinor = quote.otherFeesMinor ?? 0;
     const customerTotalMinor =
       quote.customerTotalMinor ?? Math.round(quote.proposedPrice * 100);
+    const isInspection = quote.quoteType === QuoteType.INSPECTION;
 
     await this.prisma.$transaction(async (tx) => {
       await tx.bookingQuote.update({
@@ -819,29 +958,31 @@ export class BookingsService {
         },
         data: { status: QuoteStatus.REJECTED },
       });
-      await tx.bookingInvoice.updateMany({
-        where: { bookingId: quote.bookingId, status: InvoiceStatus.ACCEPTED },
-        data: { status: InvoiceStatus.SUPERSEDED },
-      });
-      const maxVersion = await tx.bookingInvoice.aggregate({
-        where: { bookingId: quote.bookingId },
-        _max: { version: true },
-      });
-      await tx.bookingInvoice.create({
-        data: {
-          bookingId: quote.bookingId,
-          mechanicId: quote.mechanicId,
-          version: (maxVersion._max.version ?? 0) + 1,
-          status: InvoiceStatus.ACCEPTED,
-          partsMinor,
-          labourMinor,
-          otherFeesMinor,
-          customerTotalMinor,
-          source: InvoiceSource.FROM_QUOTE,
-          quoteId,
-          acceptedAt: new Date(),
-        },
-      });
+      if (!isInspection) {
+        await tx.bookingInvoice.updateMany({
+          where: { bookingId: quote.bookingId, status: InvoiceStatus.ACCEPTED },
+          data: { status: InvoiceStatus.SUPERSEDED },
+        });
+        const maxVersion = await tx.bookingInvoice.aggregate({
+          where: { bookingId: quote.bookingId },
+          _max: { version: true },
+        });
+        await tx.bookingInvoice.create({
+          data: {
+            bookingId: quote.bookingId,
+            mechanicId: quote.mechanicId,
+            version: (maxVersion._max.version ?? 0) + 1,
+            status: InvoiceStatus.ACCEPTED,
+            partsMinor,
+            labourMinor,
+            otherFeesMinor,
+            customerTotalMinor,
+            source: InvoiceSource.FROM_QUOTE,
+            quoteId,
+            acceptedAt: new Date(),
+          },
+        });
+      }
       await tx.booking.update({
         where: { id: quote.bookingId },
         data: {
@@ -949,7 +1090,6 @@ export class BookingsService {
         }
         return {
           ...b,
-          user: sanitizeUserForOpenBoard(b.user),
           distanceKm: distance,
           myQuote: b.quotes[0] ?? null,
         };
