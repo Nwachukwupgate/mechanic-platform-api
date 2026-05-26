@@ -359,6 +359,7 @@ export class WalletService {
 
     const bookingId = pending.bookingId;
     const pendingId = pending.id;
+    let paidSettlementPhase: SettlementPhase | null = null;
 
     try {
       await this.prisma.$transaction(async (tx) => {
@@ -375,6 +376,7 @@ export class WalletService {
         });
         if (!booking) return;
         const ctx = buildBookingPaymentContext(booking);
+        paidSettlementPhase = ctx.settlementPhase;
         const meta = pending.metadata as { settlementPhase?: SettlementPhase } | null;
         if (meta?.settlementPhase && meta.settlementPhase !== ctx.settlementPhase) {
           throw new BadRequestException('Payment session no longer matches booking state');
@@ -402,13 +404,8 @@ export class WalletService {
     }
 
     const bookingAfter = await this.prisma.booking.findUnique({ where: { id: bookingId } });
-    if (bookingAfter) {
-      this.eventEmitter.emit('booking.statusChanged', {
-        bookingId: bookingAfter.id,
-        status: bookingAfter.status,
-        userId: bookingAfter.userId,
-        mechanicId: bookingAfter.mechanicId,
-      });
+    if (bookingAfter && paidSettlementPhase) {
+      this.emitPostUserPaymentEvents(bookingAfter, paidSettlementPhase);
     }
     this.logger.log(`USER_PAYMENT finalized ref=${paystackRef} bookingId=${bookingId}`);
     return { applied: true };
@@ -445,12 +442,7 @@ export class WalletService {
 
     const updated = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (updated) {
-      this.eventEmitter.emit('booking.statusChanged', {
-        bookingId: updated.id,
-        status: updated.status,
-        userId: updated.userId,
-        mechanicId: updated.mechanicId,
-      });
+      this.emitPostUserPaymentEvents(updated, ctx.settlementPhase);
     }
 
     return this.prisma.booking.findUnique({
@@ -2102,5 +2094,31 @@ export class WalletService {
       include: { mechanic: { select: { id: true, companyName: true } } },
     });
     return tx;
+  }
+
+  private emitPostUserPaymentEvents(
+    booking: {
+      id: string;
+      status: BookingStatus;
+      userId: string;
+      mechanicId: string | null;
+      inspectionPaidAmount: number | null;
+    },
+    settlementPhase: SettlementPhase,
+  ) {
+    this.eventEmitter.emit('booking.statusChanged', {
+      bookingId: booking.id,
+      status: booking.status,
+      userId: booking.userId,
+      mechanicId: booking.mechanicId,
+    });
+    if (settlementPhase === SettlementPhase.INSPECTION && booking.mechanicId) {
+      this.eventEmitter.emit('inspection.paid', {
+        bookingId: booking.id,
+        mechanicId: booking.mechanicId,
+        userId: booking.userId,
+        amountNaira: booking.inspectionPaidAmount,
+      });
+    }
   }
 }

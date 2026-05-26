@@ -102,24 +102,34 @@ export class NotificationsListener {
 
   @OnEvent('quote.rejected')
   async onQuoteRejected(payload: { mechanicId: string; bookingId: string; quoteId: string }) {
+    const quote = await this.prisma.bookingQuote.findUnique({
+      where: { id: payload.quoteId },
+      select: { quoteType: true },
+    });
+    const isInspection = quote?.quoteType === 'INSPECTION';
     const mechanic = await this.prisma.mechanic.findUnique({
       where: { id: payload.mechanicId },
       select: { expoPushToken: true },
     });
     if (mechanic?.expoPushToken) {
       await this.notifications.sendExpoPush(mechanic.expoPushToken, {
-        title: 'Quote declined',
-        body: 'The customer declined your quote for this job.',
+        title: isInspection ? 'Inspection quote declined' : 'Quote declined',
+        body: isInspection
+          ? 'The customer declined your inspection fee. Update the quote and submit again.'
+          : 'The customer declined your quote for this job.',
         data: { bookingId: payload.bookingId, type: 'quote_rejected' },
-        channelId: 'bookings',
+        channelId: 'alerts',
+        priority: 'high',
       });
     }
     await this.notifications.createInApp({
       recipientRole: NotificationRecipientRole.MECHANIC,
       recipientId: payload.mechanicId,
       type: 'QUOTE_REJECTED',
-      title: 'Quote declined',
-      body: 'The customer declined your quote.',
+      title: isInspection ? 'Inspection quote declined' : 'Quote declined',
+      body: isInspection
+        ? 'The customer declined your inspection fee. You can update and resubmit your quote.'
+        : 'The customer declined your quote.',
       data: { bookingId: payload.bookingId },
     });
   }
@@ -144,7 +154,8 @@ export class NotificationsListener {
         title: 'New quote',
         body: `${mech} quoted on your job.`,
         data: { bookingId: payload.bookingId, type: 'quote_created' },
-        channelId: 'bookings',
+        channelId: 'alerts',
+        priority: 'high',
       });
     }
     await this.notifications.createInApp({
@@ -181,7 +192,8 @@ export class NotificationsListener {
         title: 'Quote accepted',
         body: 'The customer accepted your quote.',
         data: { bookingId: payload.bookingId, type: 'quote_accepted' },
-        channelId: 'bookings',
+        channelId: 'alerts',
+        priority: 'high',
       });
     }
     await this.notifications.createInApp({
@@ -209,6 +221,40 @@ export class NotificationsListener {
     });
   }
 
+  @OnEvent('inspection.paid')
+  async onInspectionPaid(payload: {
+    bookingId: string;
+    mechanicId: string;
+    userId: string;
+    amountNaira: number | null;
+  }) {
+    const mechanic = await this.prisma.mechanic.findUnique({
+      where: { id: payload.mechanicId },
+      select: { expoPushToken: true },
+    });
+    const amountLabel =
+      payload.amountNaira != null
+        ? `₦${Number(payload.amountNaira).toLocaleString()}`
+        : 'the inspection fee';
+    if (mechanic?.expoPushToken) {
+      await this.notifications.sendExpoPush(mechanic.expoPushToken, {
+        title: 'Inspection fee paid',
+        body: `The customer paid ${amountLabel}. You can start the visit and submit the repair quote.`,
+        data: { bookingId: payload.bookingId, type: 'inspection_paid' },
+        channelId: 'alerts',
+        priority: 'high',
+      });
+    }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.MECHANIC,
+      recipientId: payload.mechanicId,
+      type: 'INSPECTION_PAID',
+      title: 'Inspection fee paid',
+      body: `Customer paid ${amountLabel} for the inspection visit.`,
+      data: { bookingId: payload.bookingId },
+    });
+  }
+
   @OnEvent('booking.statusChanged')
   async onBookingStatus(payload: {
     bookingId: string;
@@ -230,6 +276,9 @@ export class NotificationsListener {
       .replace(/_/g, ' ')
       .toLowerCase()
       .replace(/\b\w/g, (c) => c.toUpperCase());
+    const majorStatus = ['PAID', 'IN_PROGRESS', 'DONE', 'DELIVERED'].includes(payload.status);
+    const pushChannel = majorStatus ? 'alerts' : 'bookings';
+    const pushPriority = majorStatus ? ('high' as const) : ('default' as const);
     if (user?.email) {
       await this.notifications.sendEmail(
         user.email,
@@ -242,7 +291,8 @@ export class NotificationsListener {
         title: 'Booking update',
         body: `Status: ${label}`,
         data: { bookingId: payload.bookingId, type: 'status', status: payload.status },
-        channelId: 'bookings',
+        channelId: pushChannel,
+        priority: pushPriority,
       });
     }
     if (mechanic?.email) {
@@ -257,7 +307,8 @@ export class NotificationsListener {
         title: 'Booking update',
         body: `Status: ${label}`,
         data: { bookingId: payload.bookingId, type: 'status', status: payload.status },
-        channelId: 'bookings',
+        channelId: pushChannel,
+        priority: pushPriority,
       });
     }
     await this.notifications.createInApp({

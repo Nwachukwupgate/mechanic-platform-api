@@ -4,12 +4,19 @@ import * as nodemailer from 'nodemailer';
 import { NotificationRecipientRole, Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 
+/** Must match assets/sounds/garage_ping.mp3 bundled in the mobile app (expo-notifications plugin). */
+export const GARAGE_PING_SOUND = 'garage_ping.mp3';
+
 export type ExpoPushMessage = {
   title: string;
   body: string;
   data?: Record<string, string>;
   /** Android notification channel (expo-notifications) */
   channelId?: string;
+  /** Use high priority + alerts channel for important job events */
+  priority?: 'default' | 'high';
+  /** Bundled custom tone; defaults to Garage Ping */
+  sound?: string | null;
 };
 
 @Injectable()
@@ -67,7 +74,8 @@ export class NotificationsService {
             title: msg.title,
             body: msg.body,
             data: msg.data ?? {},
-            sound: 'default',
+            sound: msg.sound ?? GARAGE_PING_SOUND,
+            priority: msg.priority === 'high' ? 'high' : 'default',
             ...(msg.channelId ? { channelId: msg.channelId } : {}),
           },
         ]),

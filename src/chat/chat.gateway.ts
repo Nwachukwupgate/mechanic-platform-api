@@ -114,6 +114,17 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server?.to(`booking:${payload.bookingId}`).emit('booking:statusChanged', payload);
   }
 
+  @OnEvent('inspection.paid')
+  handleInspectionPaid(payload: {
+    bookingId: string;
+    mechanicId: string;
+    userId: string;
+    amountNaira: number | null;
+  }) {
+    this.server?.to(`account:${payload.mechanicId}`).emit('inspection:paid', payload);
+    this.server?.to(`account:${payload.userId}`).emit('inspection:paid', payload);
+  }
+
   @SubscribeMessage('join_booking')
   async handleJoinBooking(
     @ConnectedSocket() client: Socket,
