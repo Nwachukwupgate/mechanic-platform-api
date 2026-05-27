@@ -62,7 +62,7 @@ export class NotificationsListener {
           title: `Message from ${senderLabel}`,
           body: preview,
           data: pushData,
-          channelId: 'messages',
+          channelId: 'messages-v2',
         });
       }
       await this.notifications.createInApp({
@@ -86,7 +86,7 @@ export class NotificationsListener {
           title: `Message from ${senderLabel}`,
           body: preview,
           data: pushData,
-          channelId: 'messages',
+          channelId: 'messages-v2',
         });
       }
       await this.notifications.createInApp({
@@ -118,7 +118,7 @@ export class NotificationsListener {
           ? 'The customer declined your inspection fee. Update the quote and submit again.'
           : 'The customer declined your quote for this job.',
         data: { bookingId: payload.bookingId, type: 'quote_rejected' },
-        channelId: 'alerts',
+        channelId: 'alerts-v2',
         priority: 'high',
       });
     }
@@ -154,7 +154,7 @@ export class NotificationsListener {
         title: 'New quote',
         body: `${mech} quoted on your job.`,
         data: { bookingId: payload.bookingId, type: 'quote_created' },
-        channelId: 'alerts',
+        channelId: 'alerts-v2',
         priority: 'high',
       });
     }
@@ -192,7 +192,7 @@ export class NotificationsListener {
         title: 'Quote accepted',
         body: 'The customer accepted your quote.',
         data: { bookingId: payload.bookingId, type: 'quote_accepted' },
-        channelId: 'alerts',
+        channelId: 'alerts-v2',
         priority: 'high',
       });
     }
@@ -241,7 +241,7 @@ export class NotificationsListener {
         title: 'Inspection fee paid',
         body: `The customer paid ${amountLabel}. You can start the visit and submit the repair quote.`,
         data: { bookingId: payload.bookingId, type: 'inspection_paid' },
-        channelId: 'alerts',
+        channelId: 'alerts-v2',
         priority: 'high',
       });
     }
@@ -277,7 +277,7 @@ export class NotificationsListener {
       .toLowerCase()
       .replace(/\b\w/g, (c) => c.toUpperCase());
     const majorStatus = ['PAID', 'IN_PROGRESS', 'DONE', 'DELIVERED'].includes(payload.status);
-    const pushChannel = majorStatus ? 'alerts' : 'bookings';
+    const pushChannel = majorStatus ? 'alerts-v2' : 'bookings-v2';
     const pushPriority = majorStatus ? ('high' as const) : ('default' as const);
     if (user?.email) {
       await this.notifications.sendEmail(

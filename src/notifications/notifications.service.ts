@@ -4,8 +4,8 @@ import * as nodemailer from 'nodemailer';
 import { NotificationRecipientRole, Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 
-/** Must match assets/sounds/garage_ping.mp3 bundled in the mobile app (expo-notifications plugin). */
-export const GARAGE_PING_SOUND = 'garage_ping.mp3';
+/** Must match assets/sounds/garage_ping.wav bundled in the mobile app (expo-notifications plugin). */
+export const GARAGE_PING_SOUND = 'garage_ping';
 
 export type ExpoPushMessage = {
   title: string;
@@ -15,7 +15,7 @@ export type ExpoPushMessage = {
   channelId?: string;
   /** Use high priority + alerts channel for important job events */
   priority?: 'default' | 'high';
-  /** Bundled custom tone; defaults to Garage Ping */
+  /** Bundled custom tone; defaults to Garage Ping (base filename, no extension). */
   sound?: string | null;
 };
 
@@ -80,8 +80,18 @@ export class NotificationsService {
           },
         ]),
       });
+      const json = (await res.json()) as {
+        data?: Array<{ status?: string; message?: string; details?: unknown }>;
+      };
       if (!res.ok) {
-        this.logger.warn(`Expo push HTTP ${res.status}`);
+        this.logger.warn(`Expo push HTTP ${res.status} ${JSON.stringify(json)}`);
+        return;
+      }
+      const ticket = json.data?.[0];
+      if (ticket?.status === 'error') {
+        this.logger.warn(
+          `Expo push ticket error: ${ticket.message ?? 'unknown'} ${JSON.stringify(ticket.details ?? {})}`,
+        );
       }
     } catch (e) {
       this.logger.warn(`sendExpoPush failed: ${e}`);
