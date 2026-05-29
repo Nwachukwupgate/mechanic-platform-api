@@ -125,6 +125,30 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server?.to(`account:${payload.userId}`).emit('inspection:paid', payload);
   }
 
+  @OnEvent('job.assigned')
+  handleJobAssigned(payload: {
+    bookingId: string;
+    mechanicId: string;
+    userId: string;
+    faultName: string;
+    vehicleLabel: string;
+  }) {
+    this.server?.to(`account:${payload.mechanicId}`).emit('job:assigned', payload);
+  }
+
+  @OnEvent('job.opened')
+  handleJobOpened(payload: {
+    bookingId: string;
+    userId: string;
+    mechanicIds: string[];
+    faultName: string;
+    vehicleLabel: string;
+  }) {
+    for (const mechanicId of payload.mechanicIds) {
+      this.server?.to(`account:${mechanicId}`).emit('job:opened', payload);
+    }
+  }
+
   @SubscribeMessage('join_booking')
   async handleJoinBooking(
     @ConnectedSocket() client: Socket,

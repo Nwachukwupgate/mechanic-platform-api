@@ -26,6 +26,10 @@ import {
   validateOpenJobPhotos,
 } from './job-posting.util';
 import {
+  mechanicProfileMatchesOpenJob,
+  OPEN_JOB_MATCH_RADIUS_KM,
+} from './open-job-matching.util';
+import {
   computeBookingPaymentSummary,
   findRepairInvoice,
   isInspectionFlow,
@@ -81,7 +85,7 @@ export class BookingsService {
     const openUntil = isOpenBoard
       ? new Date(Date.now() + OPEN_REQUEST_EXPIRY_DAYS * 86400000)
       : null;
-    return this.prisma.booking.create({
+    const booking = await this.prisma.booking.create({
       data: {
         userId,
         ...rest,
@@ -98,6 +102,132 @@ export class BookingsService {
         user: true,
       },
     });
+
+    await this.publishJobCreatedNotifications(booking.id);
+    return booking;
+  }
+
+  private jobSummaryLabels(booking: {
+    fault?: { name?: string | null } | null;
+    vehicle?: { brand?: string | null; model?: string | null } | null;
+  }) {
+    const faultName = booking.fault?.name?.trim() || 'Repair request';
+    const vehicleLabel =
+      [booking.vehicle?.brand, booking.vehicle?.model].filter(Boolean).join(' ').trim() ||
+      'vehicle';
+    return { faultName, vehicleLabel };
+  }
+
+  /** Notify mechanics when a job is assigned directly or posted to the open board. */
+  async publishJobCreatedNotifications(bookingId: string): Promise<void> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { vehicle: true, fault: true },
+    });
+    if (!booking || booking.status !== BookingStatus.REQUESTED) return;
+
+    const { faultName, vehicleLabel } = this.jobSummaryLabels(booking);
+
+    if (booking.mechanicId) {
+      this.eventEmitter.emit('job.assigned', {
+        bookingId: booking.id,
+        mechanicId: booking.mechanicId,
+        userId: booking.userId,
+        faultName,
+        vehicleLabel,
+      });
+      return;
+    }
+
+    if (!meetsOpenJobListingRequirements(booking)) return;
+
+    const mechanicIds = await this.findMatchingMechanicIdsForOpenBooking(booking);
+    if (mechanicIds.length === 0) return;
+
+    this.eventEmitter.emit('job.opened', {
+      bookingId: booking.id,
+      userId: booking.userId,
+      mechanicIds,
+      faultName,
+      vehicleLabel,
+    });
+  }
+
+  private async findMatchingMechanicIdsForOpenBooking(booking: {
+    userId: string;
+    locationLat: number | null;
+    locationLng: number | null;
+    fault: { category: string };
+    vehicle: { type: string };
+  }): Promise<string[]> {
+    const blocks = await this.prisma.userBlocksMechanic.findMany({
+      where: { userId: booking.userId },
+      select: { mechanicId: true },
+    });
+    const blockedIds = blocks.map((b) => b.mechanicId);
+
+    const profiles = await this.prisma.mechanicProfile.findMany({
+      where: {
+        availability: true,
+        mechanic: {
+          isVerified: true,
+          emailVerified: true,
+          deletedAt: null,
+          ...(blockedIds.length ? { id: { notIn: blockedIds } } : {}),
+        },
+      },
+      include: {
+        mechanic: { select: { id: true } },
+      },
+    });
+
+    const faultCategory = booking.fault.category;
+    const expertiseMapped = this.mapFaultCategoryToExpertise(faultCategory);
+    const vehicleType = this.normaliseVehicleTypeForMatch(booking.vehicle.type);
+    const matchBooking = {
+      locationLat: booking.locationLat,
+      locationLng: booking.locationLng,
+      faultCategory,
+      vehicleType,
+      expertiseMapped,
+    };
+
+    const ids: string[] = [];
+    for (const profile of profiles) {
+      let distanceKm: number | null = null;
+      if (
+        booking.locationLat != null &&
+        booking.locationLng != null &&
+        profile.latitude != null &&
+        profile.longitude != null
+      ) {
+        distanceKm = this.locationService.calculateDistance(
+          profile.latitude,
+          profile.longitude,
+          booking.locationLat,
+          booking.locationLng,
+        );
+      }
+
+      const matches = mechanicProfileMatchesOpenJob(
+        {
+          mechanicId: profile.mechanic.id,
+          expertise: Array.isArray(profile.expertise) ? profile.expertise : [],
+          vehicleTypes: Array.isArray(profile.vehicleTypes) ? profile.vehicleTypes : [],
+          latitude: profile.latitude,
+          longitude: profile.longitude,
+          availability: profile.availability,
+          isVerified: true,
+          emailVerified: true,
+          deletedAt: null,
+        },
+        matchBooking,
+        distanceKm,
+        OPEN_JOB_MATCH_RADIUS_KM,
+      );
+      if (matches) ids.push(profile.mechanic.id);
+    }
+    return ids;
   }
 
   /** Map fault category to mechanic expertise: ENGINE/BRAKES/TRANSMISSION → MECHANICAL */
@@ -1248,18 +1378,32 @@ export class BookingsService {
   }
 
   async appendBookingPhotoUrls(bookingId: string, userId: string, urls: string[]) {
-    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { fault: true },
+    });
     if (!booking || booking.userId !== userId) throw new NotFoundException('Booking not found');
     if (booking.status !== BookingStatus.REQUESTED) {
       throw new BadRequestException('Photos can only be added while the request is open');
     }
     const clean = urls.filter((u) => typeof u === 'string' && u.startsWith('http')).slice(0, 5);
     if (clean.length === 0) throw new BadRequestException('No valid image URLs');
+    const wasListedBefore =
+      !booking.mechanicId && meetsOpenJobListingRequirements(booking);
     const merged = [...(booking.photoUrls ?? []), ...clean].slice(0, 5);
-    return this.prisma.booking.update({
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: { photoUrls: merged },
+      include: { vehicle: true, fault: true },
     });
+    if (
+      !booking.mechanicId &&
+      !wasListedBefore &&
+      meetsOpenJobListingRequirements(updated)
+    ) {
+      await this.publishJobCreatedNotifications(bookingId);
+    }
+    return updated;
   }
 
   async getBookingReceipt(bookingId: string, requesterId: string, role: UserRole) {

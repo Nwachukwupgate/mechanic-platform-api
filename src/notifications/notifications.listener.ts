@@ -221,6 +221,72 @@ export class NotificationsListener {
     });
   }
 
+  @OnEvent('job.assigned')
+  async onJobAssigned(payload: {
+    bookingId: string;
+    mechanicId: string;
+    userId: string;
+    faultName: string;
+    vehicleLabel: string;
+  }) {
+    const body = `${payload.faultName} — ${payload.vehicleLabel}. Submit your quote in the app.`;
+    const mechanic = await this.prisma.mechanic.findUnique({
+      where: { id: payload.mechanicId },
+      select: { expoPushToken: true },
+    });
+    if (mechanic?.expoPushToken) {
+      await this.notifications.sendExpoPush(mechanic.expoPushToken, {
+        title: 'New job request',
+        body,
+        data: { bookingId: payload.bookingId, type: 'job_assigned' },
+        channelId: 'alerts-v2',
+        priority: 'high',
+      });
+    }
+    await this.notifications.createInApp({
+      recipientRole: NotificationRecipientRole.MECHANIC,
+      recipientId: payload.mechanicId,
+      type: 'JOB_ASSIGNED',
+      title: 'New job request',
+      body,
+      data: { bookingId: payload.bookingId },
+    });
+  }
+
+  @OnEvent('job.opened')
+  async onJobOpened(payload: {
+    bookingId: string;
+    userId: string;
+    mechanicIds: string[];
+    faultName: string;
+    vehicleLabel: string;
+  }) {
+    const body = `${payload.faultName} — ${payload.vehicleLabel}. Open job — submit a quote to bid.`;
+    const mechanics = await this.prisma.mechanic.findMany({
+      where: { id: { in: payload.mechanicIds } },
+      select: { id: true, expoPushToken: true },
+    });
+    for (const mechanic of mechanics) {
+      if (mechanic.expoPushToken) {
+        await this.notifications.sendExpoPush(mechanic.expoPushToken, {
+          title: 'New open job nearby',
+          body,
+          data: { bookingId: payload.bookingId, type: 'job_opened' },
+          channelId: 'alerts-v2',
+          priority: 'high',
+        });
+      }
+      await this.notifications.createInApp({
+        recipientRole: NotificationRecipientRole.MECHANIC,
+        recipientId: mechanic.id,
+        type: 'JOB_OPENED',
+        title: 'New open job nearby',
+        body,
+        data: { bookingId: payload.bookingId },
+      });
+    }
+  }
+
   @OnEvent('inspection.paid')
   async onInspectionPaid(payload: {
     bookingId: string;
