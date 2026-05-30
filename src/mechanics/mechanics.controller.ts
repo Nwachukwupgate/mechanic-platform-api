@@ -93,6 +93,7 @@ export class MechanicsController {
   ) {
     if (!file) throw new BadRequestException('No file uploaded');
     const url = await this.cloudinaryService.uploadFile(file);
+    await this.mechanicsService.setCertificate(mechanic.id, url);
     return { certificateUrl: url };
   }
 
@@ -116,6 +117,7 @@ export class MechanicsController {
   ) {
     if (!file) throw new BadRequestException('No file uploaded');
     const url = await this.cloudinaryService.uploadImage(file, 'mechanic-avatars');
+    await this.mechanicsService.setAvatar(mechanic.id, url);
     return { avatarUrl: url };
   }
 

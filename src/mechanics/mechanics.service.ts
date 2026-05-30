@@ -267,6 +267,24 @@ export class MechanicsService {
     });
   }
 
+  /** Persist a freshly uploaded avatar URL so it survives the next profile fetch. */
+  async setAvatar(mechanicId: string, avatar: string) {
+    return this.prisma.mechanicProfile.upsert({
+      where: { mechanicId },
+      update: { avatar },
+      create: { mechanicId, avatar, expertise: [] },
+    });
+  }
+
+  /** Persist a freshly uploaded certificate URL so it survives the next profile fetch. */
+  async setCertificate(mechanicId: string, certificateUrl: string) {
+    return this.prisma.mechanicProfile.upsert({
+      where: { mechanicId },
+      update: { certificateUrl },
+      create: { mechanicId, certificateUrl, expertise: [] },
+    });
+  }
+
   async updateAvailability(mechanicId: string, availability: boolean) {
     return this.prisma.mechanicProfile.upsert({
       where: { mechanicId },
